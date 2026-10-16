@@ -221,8 +221,6 @@ steps:
 ## 已知限制
 
 - 鎖被占用時人類說的那句話不會進歷史（只回 ⏳ 提示）。
-- `.github/scripts/backup-export.mjs` 的備份表清單尚未加入 `slack_events`、`slack_threads`。
-- `OPENAI_MODEL` 預設值 `gpt-5.5` 請依 OpenAI 官方模型清單確認。
 
 ## 最小測試 checklist（照著勾就能跑）
 
