@@ -47,11 +47,13 @@ $Tables = @(
   'profiles','departments',
   'vehicles','drivers','customers',
   'trips','maint','petty','billing','insurance','docs',
-  'workflows','tasks','task_events','notifications','uploads','agent_alerts'
+  'workflows','tasks','task_events','notifications','uploads','agent_alerts',
+  'import_batches','raw_records','field_mappings',
+  'slack_threads','slack_events'
 )
 
 # 目前用的 schema 版本標記；supabase/*.sql 有結構變動時手動更新這行。
-$SchemaVersion = 'v3（supabase/schema-v2.sql + schema-v3.sql）'
+$SchemaVersion = 'v6（supabase/schema-v2.sql + schema-v3.sql + supabase/migrations/schema-v4-raw-layer.sql + schema-v5-slack.sql + schema-v6-slack-bridge-hardening.sql）'
 
 $headers = @{
   'apikey'        = $key

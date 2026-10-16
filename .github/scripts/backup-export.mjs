@@ -16,9 +16,10 @@ const TABLES = [
   'vehicles', 'drivers', 'customers',
   'trips', 'maint', 'petty', 'billing', 'insurance', 'docs',
   'workflows', 'tasks', 'task_events', 'notifications', 'uploads', 'agent_alerts',
-  'import_batches', 'raw_records', 'field_mappings'
+  'import_batches', 'raw_records', 'field_mappings',
+  'slack_threads', 'slack_events'
 ];
-const SCHEMA_VERSION = 'v4（supabase/schema-v2.sql + schema-v3.sql + supabase/migrations/schema-v4-raw-layer.sql）';
+const SCHEMA_VERSION = 'v6（supabase/schema-v2.sql + schema-v3.sql + supabase/migrations/schema-v4-raw-layer.sql + schema-v5-slack.sql + schema-v6-slack-bridge-hardening.sql）';
 
 const outDir = 'backup-out';
 await mkdir(outDir, { recursive: true });
