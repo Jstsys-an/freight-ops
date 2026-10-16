@@ -221,3 +221,38 @@ steps:
 - 鎖被占用時人類說的那句話不會進歷史（只回 ⏳ 提示）。
 - `.github/scripts/backup-export.mjs` 的備份表清單尚未加入 `slack_events`、`slack_threads`。
 - `OPENAI_MODEL` 預設值 `gpt-5.5` 請依 OpenAI 官方模型清單確認。
+
+## 最小測試 checklist（照著勾就能跑）
+
+### 前置（先確認這些都完成）
+
+- [ ] Slack App 4 個 scope 已授權，並「重新安裝」App
+- [ ] Supabase Edge secrets 都已 set（`SLACK_BOT_TOKEN` / `SLACK_SIGNING_SECRET` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `SUPABASE_URL` / `SUPABASE_SERVICE_KEY`）
+- [ ] migration 已在 SQL Editor 跑過（`slack_threads` 表存在）
+- [ ] Edge Function 已 deploy（`supabase functions deploy slack-bridge`）
+
+### Step 1 — URL 驗證
+
+- [ ] Event Subscriptions 填入 Request URL 後顯示 Verified ✅
+  - 失敗 → 確認網址正確、函式能回 `url_verification` 的 `challenge`
+
+### Step 2 — 最小 @ 開場（建議先把 `MAX_ROUNDS` 設 2）
+
+- [ ] 在測試 thread 裡 @ 機器人說一句話
+- [ ] 3 秒內 Slack 沒出現「失敗／重試」
+- [ ] GPT 先回，頭像／名稱顯示為 GPT
+- [ ] Claude 接回，頭像／名稱顯示為 Claude
+- [ ] 達到 `MAX_ROUNDS` 後自動停（貼出上限提示），沒有無限互聊
+
+### Step 3 — 驗紀錄
+
+- [ ] `slack_threads` 有該 `thread_ts` 一筆，`history` 與 `round_count` 有更新
+- [ ] （選填）站內「🤖 執行紀錄」頁有看到對應 `agent_alerts`
+
+### 常見錯誤速查
+
+- **401 Unauthorized** → 簽章或時間差（>300 秒視為重放）；檢查 `SLACK_SIGNING_SECRET`、伺服器時鐘
+- **Slack 一直重送同一事件** → 沒在 3 秒內回 200；檢查背景處理是否卡住
+- **兩個模型停不下來** → `MAX_ROUNDS` 沒生效，或「忽略 bot 自己」邏輯沒作用
+- **頭像／名稱沒換** → 少了 `chat:write.customize`，或 `postMessage` 沒帶 `username` / `icon_url`
+- **完全沒回話** → 檢查 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` 是否正確、看 Edge Function log
