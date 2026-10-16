@@ -42,12 +42,14 @@ Slack 討論串 ──(@機器人)──▶ Edge Function
 
 ## 1. 建資料表
 
-在 Supabase SQL Editor **依序**執行（都可重複執行，具冪等性）：
+部署目前 main 前，在 Supabase SQL Editor **依序**執行 v5 → v6 → v7；已完成的 migration 不必重跑：
 
 1. `supabase/migrations/schema-v5-slack.sql`：建 `slack_threads`。
 2. `supabase/migrations/schema-v6-slack-bridge-hardening.sql`：建 `slack_events`、替 `slack_threads` 加 `processing_since`、建 `slack_thread_acquire` / `slack_thread_append` 兩個 function。
 
-v6 一定要套，否則 Edge Function 呼叫 `rpc` 會找不到 function。
+3. `supabase/migrations/schema-v7-slack-channel-isolation.sql`：將唯一鍵改為 `(channel_id, thread_ts)`，並更新 `slack_thread_acquire`，讓不同頻道的歷史、鎖與回合數互相隔離。
+
+v6 提供必要的 RPC；v7 是目前版本的必要部署前置。套用 v7 前須暫停 bridge 並等待既有工作結束。**套過 v7 後，不可單獨重跑 v6**：v6 會把 RPC 改回 `ON CONFLICT (thread_ts)`，但 v7 已移除該單欄唯一限制，會導致呼叫失敗。若需重跑舊 migration，須在 bridge 暫停期間依序完成，最後重跑 v7，再恢復服務。合併程式碼不代表資料庫已套用 migration。
 
 ## 2. 建 Slack App 並設定 OAuth scopes
 
@@ -219,5 +221,45 @@ steps:
 ## 已知限制
 
 - 鎖被占用時人類說的那句話不會進歷史（只回 ⏳ 提示）。
-- `.github/scripts/backup-export.mjs` 的備份表清單尚未加入 `slack_events`、`slack_threads`。
-- `OPENAI_MODEL` 預設值 `gpt-5.5` 請依 OpenAI 官方模型清單確認。
+
+## 最小測試 checklist（照著勾就能跑）
+
+### 前置（先確認這些都完成）
+
+- [ ] Slack App 已授權 `chat:write` / `chat:write.customize` / `app_mentions:read`；若訂閱 `message.channels` 再加 `channels:history`（私密頻道改用 `message.groups` / `groups:history`），scope 更新後重新安裝 App，並將 bot 加入測試頻道
+- [ ] 已設定四個自訂 Edge secrets：`SLACK_BOT_TOKEN` / `SLACK_SIGNING_SECRET` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`
+- [ ] 確認使用含 `serviceRoleKey()` fallback 的目前程式：託管環境自帶 `SUPABASE_URL` 與 `SUPABASE_SERVICE_ROLE_KEY`，或 `SUPABASE_SECRET_KEYS` JSON 的 `default` key；不要手動設定保留的 `SUPABASE_` secrets。本機才使用既有 `.env` 的 `SUPABASE_SERVICE_KEY`（不可提交或列印密鑰）
+- [ ] 部署前已依序套用 `supabase/migrations/schema-v5-slack.sql` → `supabase/migrations/schema-v6-slack-bridge-hardening.sql` → `supabase/migrations/schema-v7-slack-channel-isolation.sql`：確認 `slack_threads`、`slack_events`、`processing_since`、兩個 RPC 與 `(channel_id, thread_ts)` 唯一鍵都存在，`slack_thread_acquire` 依頻道與時間戳查找，且兩個 RPC 僅授權 `service_role`
+- [ ] 部署前確認 `verify.ts` 驗簽仍啟用且 `SLACK_SIGNING_SECRET` 已設定；Slack 不帶 Supabase JWT，僅此 webhook 使用 `supabase functions deploy slack-bridge --no-verify-jwt`，或第 3 節的 `[functions.slack-bridge] verify_jwt = false`。不要關閉 Slack 簽章驗證，也不要套用到其他函式
+
+> 頻道隔離修正已合併（[PR #18](https://github.com/tienan8952-source/freight-ops/pull/18)），但實際 migration 與 runtime 驗證仍須由部署者確認。依第 1 節暫停 bridge、等待既有工作結束，再套用 v7；不可單獨重跑 v6，任何舊 migration 重跑後都須以 v7 收尾。完成後應驗證不同頻道相同 `thread_ts` 的歷史、鎖與回合數互不影響。
+
+設定依據：[Supabase 環境變數](https://supabase.com/docs/guides/functions/secrets)與[外部 webhook 驗證](https://supabase.com/docs/guides/functions/auth#external-webhooks)。
+
+### Step 1 — URL 驗證
+
+- [ ] Event Subscriptions 填入 Request URL 後顯示 Verified ✅
+  - 失敗 → 確認網址正確、函式能回 `url_verification` 的 `challenge`
+
+### Step 2 — 最小 @ 開場（建議先把 `MAX_ROUNDS` 設 2，再開全新 thread；既有串保留原本上限）
+
+- [ ] 在測試頻道送出一則**全新的頻道根訊息**，內容 @ 機器人並說一句話，以這則訊息建立測試串；不要在尚未註冊的既有 thread 內首次 @ 啟動
+- [ ] 後續追問回覆在這則根訊息的 thread 內（需訂閱對應 `message` 事件，且仍受忙碌鎖與回合上限限制）
+- [ ] 3 秒內 Slack 沒出現「失敗／重試」
+- [ ] GPT 先回，頭像／名稱顯示為 GPT
+- [ ] Claude 接回，頭像／名稱顯示為 Claude
+- [ ] 達到 `MAX_ROUNDS` 後自動停（貼出上限提示），沒有無限互聊
+
+### Step 3 — 驗紀錄
+
+- [ ] `slack_threads` 的 `channel_id` / `thread_ts` 對應測試串，`history` 與 `round_count` 有更新；完成或出錯後 `processing_since` 回到 `null`
+- [ ] `slack_events` 有對應 `event_id` 與 `msg:<channel>:<ts>` 去重紀錄；同一事件重送不會多回一輪
+- [ ] （選填）站內「🤖 執行紀錄」頁有看到對應 `agent_alerts`
+
+### 常見錯誤速查
+
+- **401 Unauthorized** → 先區分來源：Supabase gateway 的 JWT／Authorization 錯誤發生在 handler 前，檢查此 webhook 的 `verify_jwt` 部署設定；handler 回 `invalid signature` 才檢查 `SLACK_SIGNING_SECRET`、`X-Slack-Signature`、原始 request body 與時間差（>300 秒會拒絕）。不要用移除驗簽來排錯
+- **Slack 一直重送同一事件** → 沒在 3 秒內回 200；先查 ACK 前的驗簽與 `slack_events` DB 寫入錯誤／延遲，再查 Edge Runtime 是否正常延續背景工作
+- **兩個模型停不下來** → `MAX_ROUNDS` 沒生效，或「忽略 bot 自己」邏輯沒作用
+- **頭像／名稱沒換** → 少了 `chat:write.customize`，或 `postMessage` 沒帶 `username` / `icon_url`
+- **完全沒回話** → 檢查 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` 是否正確、看 Edge Function log
