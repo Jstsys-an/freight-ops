@@ -1,143 +1,204 @@
-# Slack 雙模型橋接：GPT ↔ Claude 在討論串對話（MVP）
+# Slack bridge：兩個 LLM 在 Slack 討論串輪流對話
 
-在 Slack 頻道 `@機器人 題目`，會看到兩個不同名字、不同頭像的回覆：先 **GPT** 回答，再 **Claude** 針對 GPT 的話接話。
-整件事只靠一支 Supabase Edge Function 跟兩張小表，不用另外架 server。
-
----
-
-## 架構圖
+讓 OpenAI（顯示為 **GPT**）與 Anthropic（顯示為 **Claude**）在同一個 Slack 討論串裡一來一回地對話，背後是一支 Supabase Edge Function（`supabase/functions/slack-bridge`）。
 
 ```
-Slack 頻道
-  │  使用者：@bridge 空運跟海運怎麼選？
-  ▼
-Slack Events API（app_mention）
-  │  POST https://<project-ref>.supabase.co/functions/v1/slack-bridge
-  ▼
-Edge Function: slack-bridge
-  ├─ 1. 驗 X-Slack-Signature（HMAC-SHA256，5 分鐘內）
-  ├─ 2. slack_events 去重（event_id 撞到就略過）
-  ├─ 3. 立刻回 200（Slack 只等 3 秒）
-  └─ 4. EdgeRuntime.waitUntil(背景工作)
-         ├─ slack_threads upsert（題目、回合上限）
-         ├─ OpenAI  ──► chat.postMessage（username: GPT,    icon: GPT_ICON）
-         ├─ Anthropic ─► chat.postMessage（username: Claude, icon: CLAUDE_ICON）
-         └─ 每則回覆 append 到 slack_threads.turns，turn_count +1
+Slack 討論串 ──(@機器人)──▶ Edge Function
+                              ├─ 1. 驗簽（verify.ts）
+                              ├─ 2. slack_events 去重（event_id + 訊息 ts）
+                              ├─ 3. 回 200，背景繼續
+                              └─ 4. slack_thread_acquire：搶到這個串的處理權（鎖）才往下
+                                     │
+                     ┌───────────────┴───────────────┐
+                 OpenAI（GPT）                 Anthropic（Claude）
+                     └───────────────┬───────────────┘
+                                     ▼
+                         chat.postMessage 貼回同一串
+                         （每句都用 slack_thread_append 原子寫回 slack_threads）
+                                     ▼
+                         結束（含錯誤）釋放鎖 processing_since = null
 ```
+
+- 只在「被 @ 提到機器人」的討論串裡運作；忽略任何 bot 的訊息（防無限迴圈）。
+- **安全閥**：每個討論串有回合上限（`MAX_ROUNDS`，預設 6；一回合 = GPT 一句 + Claude 一句）。數到上限就停手、改貼一則「回合上限已達」通知，不會無限對話、無限燒 API 額度。
+- **跨實例鎖**：同一個串同時只會有一個實例在跑，不會兩邊各自算回合、互相覆蓋。
+
+> 下列密鑰一律由你（使用者）自行設定，**絕不會**放進這個 repo 或任何 commit。
 
 相關檔案：
 
 | 檔案 | 用途 |
 |---|---|
-| `supabase/functions/slack-bridge/index.ts` | 主程式（入口、Slack API、兩個模型、資料庫） |
+| `supabase/functions/slack-bridge/index.ts` | 主程式（入口、Slack API、兩個模型、資料庫、對話迴圈） |
 | `supabase/functions/slack-bridge/verify.ts` | Slack 簽章驗證（純 Web Crypto，可單測） |
-| `supabase/functions/slack-bridge/verify_test.ts` | 簽章驗證單元測試 |
-| `supabase/functions/slack-bridge/deno.json` | 這支 function 的依賴（Supabase 建議每支 function 各一份） |
-| `supabase/migrations/schema-v5-slack-bridge.sql` | `slack_events`、`slack_threads` 兩張表 |
+| `supabase/functions/slack-bridge/lib.ts` | 純函式：環境變數驗證、事件過濾、文字處理 |
+| `supabase/functions/slack-bridge/*_test.ts` | 單元測試（`deno test supabase/functions/slack-bridge/`） |
+| `supabase/functions/slack-bridge/deno.json` | 這支 function 的依賴（openai / @anthropic-ai/sdk / @supabase/supabase-js） |
+| `supabase/migrations/schema-v5-slack.sql` | 建 `slack_threads`（歷史、輪到誰、回合數、上限） |
+| `supabase/migrations/schema-v6-slack-bridge-hardening.sql` | 建 `slack_events`（去重）、加 `processing_since`（鎖）、兩個 SQL function |
 | `.env.example` | 需要的環境變數清單 |
 
 ---
 
-## 一、建 Slack App
+## 1. 建資料表
 
-到 https://api.slack.com/apps → **Create New App** → **From a manifest**，貼下面這份（頻道名稱、App 名稱可改）：
+在 Supabase SQL Editor **依序**執行（都可重複執行，具冪等性）：
 
-```yaml
-display_information:
-  name: bridge
-  description: GPT 與 Claude 在討論串對話
-features:
-  bot_user:
-    display_name: bridge
-    always_online: true
-oauth_config:
-  scopes:
-    bot:
-      - app_mentions:read      # 收到被 @ 的事件
-      - chat:write             # 發訊息
-      - chat:write.customize   # 用自訂名字／頭像發訊息（GPT、Claude 就是靠這個）
-settings:
-  event_subscriptions:
-    request_url: https://<project-ref>.supabase.co/functions/v1/slack-bridge
-    bot_events:
-      - app_mention
-  org_deploy_enabled: false
-  socket_mode_enabled: false
-  token_rotation_enabled: false
+1. `supabase/migrations/schema-v5-slack.sql`：建 `slack_threads`。
+2. `supabase/migrations/schema-v6-slack-bridge-hardening.sql`：建 `slack_events`、替 `slack_threads` 加 `processing_since`、建 `slack_thread_acquire` / `slack_thread_append` 兩個 function。
+
+v6 一定要套，否則 Edge Function 呼叫 `rpc` 會找不到 function。
+
+## 2. 建 Slack App 並設定 OAuth scopes
+
+到 <https://api.slack.com/apps> 建立 App，於 **OAuth & Permissions → Scopes → Bot Token Scopes** 加入：
+
+| Scope | 用途 |
+| --- | --- |
+| `chat:write` | 貼訊息 |
+| `chat:write.customize` | 用 `username` + `icon_emoji` / `icon_url` 讓 GPT／Claude 顯示成不同身分 |
+| `app_mentions:read` | 收到「被 @ 提到」事件 |
+| `channels:history` | （選用）訂閱 `message.channels` 時才需要；私密頻道改用 `groups:history` |
+
+安裝 App 到工作區後，複製 **Bot User OAuth Token**（`xoxb-...`）當作 `SLACK_BOT_TOKEN`，並到 **Basic Information → App Credentials** 複製 **Signing Secret** 當作 `SLACK_SIGNING_SECRET`。
+
+## 3. 部署 Edge Function
+
+```bash
+supabase functions deploy slack-bridge --no-verify-jwt
 ```
 
-建好後要拿兩個值：
-
-| 要拿的值 | 位置 | 對應環境變數 |
-|---|---|---|
-| Signing Secret | Basic Information → App Credentials | `SLACK_SIGNING_SECRET` |
-| Bot User OAuth Token（`xoxb-…`） | OAuth & Permissions → Install to Workspace 之後 | `SLACK_BOT_TOKEN` |
-
-注意：**Request URL 要等 Edge Function 部署好才能存**（Slack 會先打一個 `url_verification` 來握手）。所以順序是：先部署（第二節）→ 再回 Slack 填 Request URL。
-
----
-
-## 二、部署
-
-### 1. 套 migration
-
-到 Supabase Dashboard → SQL Editor，貼上 `supabase/migrations/schema-v5-slack-bridge.sql` 整段執行（可重複執行）。
-
-### 2. 設定 secrets 並部署
-
-```yaml
-# 在 repo 根目錄執行（先 supabase login、supabase link --project-ref <project-ref>）
-steps:
-  - name: 設定 Edge Function 的環境變數（值不要寫進 repo）
-    run: |
-      supabase secrets set \
-        SLACK_BOT_TOKEN=xoxb-... \
-        SLACK_SIGNING_SECRET=... \
-        OPENAI_API_KEY=sk-... \
-        ANTHROPIC_API_KEY=sk-ant-...
-      # 選填（有預設值）：
-      # supabase secrets set OPENAI_MODEL=gpt-5.5 ANTHROPIC_MODEL=claude-opus-5-5 \
-      #   GPT_ICON=:robot_face: CLAUDE_ICON=:sparkles: BRIDGE_MAX_TURNS=2
-      # 或者整包從 .env 推：supabase secrets set --env-file .env
-
-  - name: 部署（--no-verify-jwt：Slack 不會帶 Supabase JWT，改由程式自己驗 Slack 簽章）
-    run: supabase functions deploy slack-bridge --no-verify-jwt
-
-  - name: 確認
-    run: supabase secrets list
-```
-
-另一種寫法是在 `supabase/config.toml` 固定設定，之後部署就不用每次帶旗標：
+`--no-verify-jwt`：Slack 不會帶 Supabase JWT，改由程式自己驗 Slack 簽章。也可以在 `supabase/config.toml` 固定：
 
 ```toml
 [functions.slack-bridge]
 verify_jwt = false
 ```
 
-> `SUPABASE_URL`、`SUPABASE_SERVICE_ROLE_KEY`（新版專案叫 `SUPABASE_SECRET_KEYS`）在 Edge Function 環境內建，不用自己設；程式兩種名稱都會認。
+部署後函式網址長這樣（`<ref>` 是你的專案代號）：
 
-### 3. 回 Slack 填 Request URL
+```
+https://<ref>.supabase.co/functions/v1/slack-bridge
+```
 
-Event Subscriptions → Request URL 填 `https://<project-ref>.supabase.co/functions/v1/slack-bridge`，看到 **Verified** 就完成。若沒通過，先看 `supabase functions logs slack-bridge`，最常見是 `SLACK_SIGNING_SECRET` 貼錯。
+## 4. 設定 Supabase Edge Secrets
+
+函式只從環境變數讀密鑰，程式裡不寫死任何值。用 `supabase secrets set` 設定（變數名稱與說明見 `.env.example`）：
+
+```bash
+supabase secrets set \
+  SLACK_BOT_TOKEN=xoxb-你的-token \
+  SLACK_SIGNING_SECRET=你的-signing-secret \
+  OPENAI_API_KEY=sk-你的-openai-key \
+  ANTHROPIC_API_KEY=sk-ant-你的-anthropic-key
+# 選填（有預設值）：
+# supabase secrets set OPENAI_MODEL=gpt-5.5 OPENAI_REASONING_EFFORT=low \
+#   ANTHROPIC_MODEL=claude-opus-5-5 GPT_ICON=:robot_face: CLAUDE_ICON=:sparkles: MAX_ROUNDS=6
+# 或整包從 .env 推：supabase secrets set --env-file .env
+```
+
+| 變數 | 必填 | 預設 | 說明 |
+|---|---|---|---|
+| `SLACK_BOT_TOKEN` | 是 | — | Bot User OAuth Token |
+| `SLACK_SIGNING_SECRET` | 是 | — | 驗簽用 |
+| `OPENAI_API_KEY` | 是 | — | |
+| `OPENAI_MODEL` | 否 | `gpt-5.5` | 依 OpenAI 官方模型清單調整 |
+| `OPENAI_REASONING_EFFORT` | 否 | `low` | `none`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`；非推理模型填 `off` 不送參數 |
+| `ANTHROPIC_API_KEY` | 是 | — | |
+| `ANTHROPIC_MODEL` | 否 | `claude-opus-5-5` | |
+| `GPT_ICON` / `CLAUDE_ICON` | 否 | `:robot_face:` / `:sparkles:` | emoji 或圖片 URL（`https://` 開頭自動改用 `icon_url`） |
+| `MAX_ROUNDS` | 否 | `6` | 正整數；建立新串時寫進 `slack_threads.max_rounds` |
+
+**環境變數驗證規則**（`lib.ts`）：沒設、空白、或以 `#` 開頭的值一律視為未設定、用預設值；`MAX_ROUNDS` 必須是正整數（`0`、負數、小數、文字都會退回預設 6）；`OPENAI_REASONING_EFFORT` 不在清單內會退回 `low`。必填的密鑰缺了，函式啟動時直接 throw，`supabase functions logs slack-bridge` 會看到「缺少環境變數 …」。
+
+- `SUPABASE_URL` 與 service role key 在 Edge Function 環境**內建**（`SUPABASE_SERVICE_ROLE_KEY`，新版專案叫 `SUPABASE_SECRET_KEYS`），不用設、也不能用 `secrets set` 設 `SUPABASE_` 開頭的變數。本機 `serve` 時程式也接受 `.env` 裡既有的 `SUPABASE_SERVICE_KEY`。
+- service role key 會繞過 RLS，只設在 Edge Secrets 或本機 `.env`，**不要**提交或外流。
+
+## 5. 設定 Event Subscriptions
+
+在 Slack App 的 **Event Subscriptions**：
+
+1. 開啟 Enable Events。
+2. **Request URL** 填上面的函式網址。Slack 會送一個 `url_verification` 挑戰，函式會自動回覆
+   `challenge`，顯示 **Verified** 即成功（要等函式部署好才能存）。
+3. 於 **Subscribe to bot events** 加入 `app_mention`。要讓人類在串裡的追問也進對話，再加
+   `message.channels`（需要 `channels:history` scope）。
+4. 儲存後重新安裝 App 讓 scope 生效。
 
 ---
 
-## 三、測試
+## 使用方式
 
-1. 把機器人加進頻道（在頻道打 `/invite @bridge`）。
-2. 在頻道輸入：`@bridge 空運跟海運怎麼選？`
-3. 預期在同一個討論串裡看到兩則回覆：
-   - 名字 **GPT**、頭像 `:robot_face:`（或你設的 `GPT_ICON`）
-   - 名字 **Claude**、頭像 `:sparkles:`（或你設的 `CLAUDE_ICON`），內容會針對 GPT 的回覆接話
-4. 到 Supabase Table Editor 看 `slack_threads`：應有一筆，`turns` 有兩個元素、`turn_count = 2`。
-5. 出錯時討論串會出現 `⚠️ bridge 錯誤：<原因>`，細節看 `supabase functions logs slack-bridge`。
+在任一討論串 @ 機器人並說一句話，GPT 與 Claude 就會開始輪流接話，貼在同一串裡，直到達到
+`MAX_ROUNDS` 回合上限才停止。有訂閱 `message.channels` 的話，人類在同一串裡再說話會被加進歷史、再接著聊（仍受同一個回合上限管）。
 
-### 本機測試（可選）
+## 運作細節
+
+### 去重與 Slack 重送
+
+- 每個事件先 insert `slack_events`（`event_id` 為 primary key），撞到 `23505` 就略過。
+- Slack 3 秒沒收到 200 會重送同一事件（帶 `X-Slack-Retry-Num`）。**重送不看 header 短路**，一樣走
+  `event_id` 去重：第一次沒寫成功（例如 DB 暫時失敗）重送才有機會補上。
+- 同一則 @ 訊息，Slack 會同時發 `app_mention` 與 `message` 兩個事件（`event_id` 不同），所以
+  另外用 `msg:<channel>:<ts>` 再去重一次，只處理先到的那個。
+- `slack_events` 只是去重用，v6 migration 底部有可選的 pg_cron 清理（保留 7 天）。
+
+### 跨實例鎖（thread 鎖）
+
+Edge Function 可能同時有多個實例在跑。呼叫模型之前，先用 `slack_thread_acquire` 在 DB 端搶處理權：
+
+```sql
+update slack_threads set processing_since = now()
+ where thread_ts = $2
+   and (processing_since is null or processing_since < now() - interval '10 minutes')
+   and round_count < max_rounds
+returning *;
+```
+
+- 搶到（`acquired`）才讀歷史、叫模型；每一句都用 `slack_thread_append` 一道 update 寫回
+  （append history、翻 `next_turn`、翻回 gpt 時 `round_count + 1`），不會讀-改-寫被插隊。
+- 搶不到：別的實例正在處理 → 在串裡回「⏳ 這個討論串正在處理中，請稍候再試。」（那句話不會進歷史，
+  等這輪跑完再說一次即可）；已達上限 → 回「🛑 已達回合上限」。
+- 流程結束（含錯誤）一定把 `processing_since` 清回 `null`；實例被砍沒清到的話，10 分鐘後鎖自動過期。
+
+### 事件過濾
+
+`lib.ts` 的 `isHandledEvent`：
+
+| 條件 | 結果 |
+|---|---|
+| `event.bot_id` 存在（任何 bot，含機器人自己用 username 覆寫發的） | 略過（防無限迴圈） |
+| `subtype` 是 `message_changed` / `message_deleted` | 略過（不是新發言） |
+| `subtype` 是 `thread_broadcast` / `file_share` 等 | **保留**（仍是人的新發言） |
+| `type` 不是 `app_mention` / `message` | 略過 |
+
+不是 @ 的 `message` 事件，只有在該串已存在（之前被 @ 過）時才會處理；否則靜默略過。
+
+### 頭像與名稱
+
+`username` 固定為 `GPT` / `Claude`；頭像由 `GPT_ICON` / `CLAUDE_ICON` 決定，`https://` 開頭用 `icon_url`，否則當 emoji 用 `icon_emoji`。需要 `chat:write.customize` scope。
+
+### 模型呼叫
+
+- OpenAI：Responses API（`openai.responses.create`），`max_output_tokens: 1024`，`reasoning.effort` 由 `OPENAI_REASONING_EFFORT` 決定。
+- Anthropic：`anthropic.beta.messages.create`，`max_tokens: 1024`，`thinking: { type: "adaptive" }`，`output_config: { effort: "low" }`，並開啟 server-side fallback（`betas: ["server-side-fallback-2026-07-01"]` + `fallbacks: "default"`）；回應先看 `stop_reason === "refusal"`，婉拒時貼「（Claude 這題婉拒回答：…）」而不是空訊息。
+- 兩邊都是「系統指示 + 一則 user 訊息（整串逐字稿）」的寫法，不會踩到 user/assistant 必須交替的限制。
+
+### agent_alerts 側寫
+
+模型呼叫失敗、背景處理失敗、回合上限已達，都會 best-effort 寫一筆 `agent_alerts`（`session = 'slack-bridge'`），在網站「執行紀錄」頁看得到；寫失敗不影響 Slack 對話。
+
+---
+
+## 本機測試
 
 ```yaml
 steps:
-  - run: deno test supabase/functions/slack-bridge/verify_test.ts     # 簽章驗證單元測試
-  - run: deno check supabase/functions/slack-bridge/index.ts          # 型別檢查（需能連 npm registry）
+  - run: deno test supabase/functions/slack-bridge/
+    note: verify_test.ts（簽章）+ lib_test.ts（環境變數驗證、事件過濾）
+  - run: deno lint supabase/functions/slack-bridge/
+  - run: deno check supabase/functions/slack-bridge/index.ts
+    note: 型別檢查（需能連 npm registry）
   - run: supabase functions serve slack-bridge --no-verify-jwt --env-file .env
     note: |
       本機 serve 預設回應完就關掉實例，背景工作（EdgeRuntime.waitUntil）會被砍掉。
@@ -146,44 +207,17 @@ steps:
         policy = "per_worker"
 ```
 
----
+## 安全與額度提醒
 
-## 四、安全閥
+- **回合上限是安全閥**：兩個 LLM 會互相接話，若不設限會無限對話、一直消耗 OpenAI／Anthropic 額度。
+  到達 `MAX_ROUNDS` 就會自動停手並貼通知。要繼續請調高 `MAX_ROUNDS`（只影響新串）、直接改該筆的
+  `slack_threads.max_rounds`，或重開新討論串。
+- 函式會用 `SLACK_SIGNING_SECRET` 驗證每個請求的簽章（`verify.ts`），並拒絕時間戳超過 5 分鐘的請求（擋重放）。
+- 兩個模型每句最多 1024 token、推理強度 low；預設模型是兩家的旗艦等級，要省就改 `OPENAI_MODEL` / `ANTHROPIC_MODEL`。
+- 所有密鑰都存在 Supabase Edge Secrets，不在本 repo 裡；`.env` 已被 `.gitignore` 排除。
 
-| 機制 | 說明 |
-|---|---|
-| 只在被 @ 時觸發 | 只訂閱 `app_mention`，頻道裡一般對話完全不會送到 function，也不會花錢。 |
-| 每個討論串回合上限 | `slack_threads.max_turns`（建立時取 `BRIDGE_MAX_TURNS`，預設 2 = GPT 一則 + Claude 一則）。達上限後再 @ 會回「已達回合上限」，不再呼叫模型。想在同一串多聊幾輪，調高 `BRIDGE_MAX_TURNS` 或直接改該筆的 `max_turns`。 |
-| 忽略機器人訊息 | `event.bot_id` 或 `event.subtype` 存在就略過，避免 GPT/Claude 的訊息（用機器人身分發的）又觸發自己。 |
-| 簽章驗證 | 沒有正確 `X-Slack-Signature` 或 timestamp 超過 5 分鐘一律回 401。 |
-| 去重 | `X-Slack-Retry-Num` 存在直接回 200；`slack_events.event_id` 撞到也略過。 |
-| 回覆長度 | 兩個模型 `max_tokens` 都是 1024，提示詞要求 3 到 6 句，Slack 讀起來不會太長。 |
+## 已知限制
 
----
-
-## 五、費用提醒
-
-- 每次 @ 一題 = 1 次 OpenAI 呼叫 + 1 次 Anthropic 呼叫，兩邊都設了低推理強度（`reasoning.effort: low` / `output_config.effort: low`）與 1024 token 上限。
-- 預設模型是兩家的旗艦等級，單則回覆費用大約落在幾分到十幾分美金；若要省，改 `OPENAI_MODEL` / `ANTHROPIC_MODEL` 成較小的模型。
-- 模型名稱請以官方清單為準：OpenAI https://platform.openai.com/docs/models 、Anthropic https://platform.claude.com/docs/en/about-claude/models 。
-- Supabase Edge Function 本身：免費方案每月有呼叫數與執行時間額度，這個用量（人手動 @）幾乎不會碰到。
-
----
-
-## 六、已知限制與下一步
-
-**已知限制（MVP）**
-
-- 一次 @ 只各回一則，不會自動繼續來回；`max_turns` 預設 2，第二次在同一串 @ 會被安全閥擋下（要多聊請調高）。
-- 沒有把 Slack 討論串的歷史訊息餵給模型，只有「題目」與「GPT 的回覆」。
-- `OPENAI_MODEL` 預設值 `gpt-5.5` 取自 openai-node 官方 README 的範例（撰寫時官方模型頁無法連線），請依 OpenAI 官方模型清單調整。
-- `OPENAI_REASONING_EFFORT` 預設 `low`；若改用不支援 reasoning 參數的模型，把它設成空字串。
-- 背景工作上限受 Edge Function 的 wall-clock / CPU 限制，兩個模型各一則通常幾十秒內完成，不會碰到。
-- `.github/scripts/backup-export.mjs` 的備份表清單尚未加入 `slack_events`、`slack_threads`（要備份對話紀錄的話再加）。
-
-**下一步**
-
-1. **回合輪替**：讓 Claude 回完後 GPT 再接、一直到 `max_turns`；`turns` 已經把每一棒存下來，只要把 `run()` 改成迴圈、把整段 `turns` 餵給下一個模型即可。
-2. **同步到 `agent_alerts`**：每串對話結束時寫一筆摘要進既有的 `agent_alerts`，讓營運畫面看得到 AI 討論結果。
-3. **讀討論串上下文**：用 `conversations.replies` 把人類在串裡的追問一起餵給模型（需加 scope `channels:history`）。
-4. **前端檢視**：若要在系統畫面看 `slack_threads`，補 RLS select policy（例如 `has_perm('slack.view')`）。
+- 鎖被占用時人類說的那句話不會進歷史（只回 ⏳ 提示）。
+- `.github/scripts/backup-export.mjs` 的備份表清單尚未加入 `slack_events`、`slack_threads`。
+- `OPENAI_MODEL` 預設值 `gpt-5.5` 請依 OpenAI 官方模型清單確認。
