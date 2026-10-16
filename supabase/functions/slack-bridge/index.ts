@@ -418,7 +418,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
   // 去重（兩把鍵都寫 slack_events，撞到就略過）：
   //   1. event_id：Slack 3 秒沒收到 200 會重送，重送也走這條，不看 X-Slack-Retry-Num。
   //   2. 訊息本身（channel:ts）：同一則 @ 訊息，Slack 會同時發 app_mention 與 message 兩個事件
-  //      （event_id 不同），只處理第一個到的。
+  //      （event_id 不同），只處理第一個通過過濾的；根 message 已由 isHandledEvent
+  //      略過，讓可開新串的 app_mention 保留這把鍵。
   if (payload.event_id && !(await markOnce(payload.event_id))) return new Response("ok");
   if (event.channel && event.ts && !(await markOnce(`msg:${event.channel}:${event.ts}`))) return new Response("ok");
 

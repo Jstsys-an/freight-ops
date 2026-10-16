@@ -48,13 +48,18 @@ export interface SlackEventLike {
  * 回 true 代表這個事件值得處理。
  *  - 忽略任何 bot 的訊息（含機器人自己用 username 覆寫發的）→ 防無限迴圈。
  *  - 忽略 message_changed / message_deleted；保留 thread_broadcast、file_share 等（它們仍是人的新發言）。
- *  - 只收 app_mention 與 message 兩種型別。
+ *  - app_mention 可開新串；message 只收真正的串內回覆。
+ *    根訊息的 message 必須在去重前略過，避免搶走 app_mention 的 msg: 鍵。
  */
 export function isHandledEvent(event: SlackEventLike | null | undefined): boolean {
   if (!event || typeof event !== "object") return false;
   if (event.bot_id) return false;
   if (typeof event.subtype === "string" && IGNORED_SUBTYPES.includes(event.subtype)) return false;
-  return event.type === "app_mention" || event.type === "message";
+  if (event.type === "app_mention") return true;
+  return event.type === "message" &&
+    typeof event.thread_ts === "string" && event.thread_ts.length > 0 &&
+    typeof event.ts === "string" && event.ts.length > 0 &&
+    event.thread_ts !== event.ts;
 }
 
 // ---------- Slack 文字 / 貼文欄位 ----------
