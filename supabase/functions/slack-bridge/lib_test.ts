@@ -60,30 +60,86 @@ Deno.test("envChoice：只接受清單內的值", () => {
 });
 
 // ---------- isHandledEvent ----------
-Deno.test("isHandledEvent：app_mention 與一般 message 要處理", () => {
+Deno.test("isHandledEvent：app_mention 與串內 message 要處理", () => {
   assert(isHandledEvent({ type: "app_mention", text: "<@U1> hi" }), "app_mention");
-  assert(isHandledEvent({ type: "message", text: "hi" }), "message");
+  assert(isHandledEvent({ type: "message", text: "hi", ts: "2.0", thread_ts: "1.0" }), "message");
 });
 
 Deno.test("isHandledEvent：任何 bot 訊息一律略過（防無限迴圈）", () => {
-  assert(!isHandledEvent({ type: "message", bot_id: "B123", subtype: "bot_message" }), "bot_message");
+  assert(!isHandledEvent({ type: "message", bot_id: "B123", subtype: "bot_message", ts: "2.0", thread_ts: "1.0" }), "bot_message");
   assert(!isHandledEvent({ type: "app_mention", bot_id: "B123" }), "bot app_mention");
 });
 
 Deno.test("isHandledEvent：message_changed / message_deleted 略過", () => {
-  assert(!isHandledEvent({ type: "message", subtype: "message_changed" }), "message_changed");
-  assert(!isHandledEvent({ type: "message", subtype: "message_deleted" }), "message_deleted");
+  assert(!isHandledEvent({ type: "message", subtype: "message_changed", ts: "2.0", thread_ts: "1.0" }), "message_changed");
+  assert(!isHandledEvent({ type: "message", subtype: "message_deleted", ts: "2.0", thread_ts: "1.0" }), "message_deleted");
 });
 
 Deno.test("isHandledEvent：thread_broadcast / file_share 保留", () => {
-  assert(isHandledEvent({ type: "message", subtype: "thread_broadcast", text: "x" }), "thread_broadcast");
-  assert(isHandledEvent({ type: "message", subtype: "file_share", text: "x" }), "file_share");
+  assert(isHandledEvent({ type: "message", subtype: "thread_broadcast", text: "x", ts: "2.0", thread_ts: "1.0" }), "thread_broadcast");
+  assert(isHandledEvent({ type: "message", subtype: "file_share", text: "x", ts: "2.0", thread_ts: "1.0" }), "file_share");
 });
 
 Deno.test("isHandledEvent：其他型別 / 空值 → false", () => {
   assert(!isHandledEvent({ type: "reaction_added" }), "reaction_added");
   assert(!isHandledEvent(null), "null");
   assert(!isHandledEvent(undefined), "undefined");
+});
+
+
+Deno.test("isHandledEvent：根 message 在去重前略過，交由 app_mention 開串", () => {
+  const root = { type: "message", channel: "C1", ts: "1.0", text: "<@U1> hi" };
+  assert(!isHandledEvent(root), "沒有 thread_ts 的根訊息");
+  assert(!isHandledEvent({ ...root, thread_ts: root.ts }), "thread_ts 等於 ts 的根訊息");
+  assert(!isHandledEvent({ ...root, text: "ordinary message" }), "一般頻道訊息");
+  assert(!isHandledEvent({ ...root, thread_ts: "" }), "空 thread_ts");
+  assert(!isHandledEvent({ ...root, thread_ts: 123 }), "非字串 thread_ts");
+  assert(!isHandledEvent({ ...root, thread_ts: "0.0", ts: undefined }), "缺少 ts");
+  assert(isHandledEvent({ ...root, type: "app_mention" }), "根 mention");
+  assert(isHandledEvent({ ...root, type: "app_mention", thread_ts: root.ts }), "明確的根 mention");
+});
+
+// 模擬 HTTP 入口的「先過濾，再 event_id / msg: 去重」次序。
+// 不呼叫 Slack、模型或資料庫；驗證根 mention 不論先後及重送都只會進入一次。
+Deno.test("isHandledEvent：根 mention 的兩種事件順序與重送都保留一次開串", () => {
+  for (const thread_ts of [undefined, "1.0"]) {
+    const root = { channel: "C1", ts: "1.0", thread_ts, text: "<@U1> hi" };
+    const message = { event_id: "EvMessage", event: { ...root, type: "message" } };
+    const mention = { event_id: "EvMention", event: { ...root, type: "app_mention" } };
+    for (const deliveries of [[message, mention, message, mention], [mention, message, mention, message]]) {
+      const seen = new Set<string>();
+      const handled: string[] = [];
+      for (const { event_id, event } of deliveries) {
+        if (!isHandledEvent(event)) continue;
+        if (seen.has(event_id)) continue;
+        seen.add(event_id);
+        const key = `msg:${event.channel}:${event.ts}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        handled.push(event.type);
+      }
+      assertEq(handled.length, 1, "只處理一次");
+      assertEq(handled[0], "app_mention", "保留可建立新串的事件");
+      assert(!seen.has("EvMessage"), "根 message 不消耗任何去重鍵");
+    }
+  }
+});
+
+Deno.test("isHandledEvent：串內追問與 mention 的 message 副本仍可去重", () => {
+  const reply = { channel: "C1", ts: "2.0", thread_ts: "1.0", text: "<@U1> follow-up" };
+  for (const types of [["message", "app_mention"], ["app_mention", "message"]]) {
+    const seen = new Set<string>();
+    let handled = 0;
+    for (const type of types) {
+      const event = { ...reply, type };
+      assert(isHandledEvent(event), "串內事件保留");
+      const key = `msg:${event.channel}:${event.ts}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      handled++;
+    }
+    assertEq(handled, 1, "串內同一訊息只處理一次");
+  }
 });
 
 // ---------- stripMentions / iconField ----------
