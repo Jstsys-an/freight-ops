@@ -1,7 +1,7 @@
 // 讀 SUPABASE_URL / SUPABASE_SERVICE_KEY 環境變數（由 workflow 從 GitHub Secrets 帶入），
 // 把下面 TABLES 每張表匯出成 backup-out/<table>.json，並產生 manifest.json。
 // 這份表清單跟本機的 scripts/backup.ps1 分開維護（那份是本機備份，這份是雲端排程備份），
-// 之後在 supabase/*.sql 新增資料表時，記得兩邊都要同步加（見 docs/known-issues.md 待處理項）。
+// 之後在 supabase/*.sql 新增資料表時，記得兩邊都要同步加。
 import { mkdir, writeFile } from 'node:fs/promises';
 
 const url = process.env.SUPABASE_URL;
@@ -16,9 +16,10 @@ const TABLES = [
   'vehicles', 'drivers', 'customers',
   'trips', 'maint', 'petty', 'billing', 'insurance', 'docs',
   'workflows', 'tasks', 'task_events', 'notifications', 'uploads', 'agent_alerts',
-  'import_batches', 'raw_records', 'field_mappings'
+  'import_batches', 'raw_records', 'field_mappings',
+  'slack_events', 'slack_threads'
 ];
-const SCHEMA_VERSION = 'v4（supabase/schema-v2.sql + schema-v3.sql + supabase/migrations/schema-v4-raw-layer.sql）';
+const SCHEMA_VERSION = 'v7（supabase/schema-v2.sql + schema-v3.sql + supabase/migrations/schema-v4-raw-layer.sql、schema-v5-slack.sql、schema-v6-slack-bridge-hardening.sql、schema-v7-slack-channel-isolation.sql）';
 
 const outDir = 'backup-out';
 await mkdir(outDir, { recursive: true });
