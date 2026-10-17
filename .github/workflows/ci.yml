@@ -1,17 +1,82 @@
-# PR 與 main 的快速檢查：前端 JS 語法、備份腳本語法、slack-bridge 單元測試。
+# PR 與 main 的快速檢查：依變更路徑執行 JS 語法、slack-bridge 品質/測試、SQL 回歸測試。
 name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  check:
+  changes:
+    name: CI | 變更判定
     runs-on: ubuntu-latest
+    outputs:
+      run_all: ${{ steps.mode.outputs.run_all }}
+      run_js: ${{ steps.resolve.outputs.run_js }}
+      run_deno: ${{ steps.resolve.outputs.run_deno }}
+      run_sql: ${{ steps.resolve.outputs.run_sql }}
+    steps:
+      - name: 判定執行模式
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run_all=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_all=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: ${{ steps.mode.outputs.run_all == 'false' }}
+
+      - name: 依路徑判定檢查範圍
+        if: ${{ steps.mode.outputs.run_all == 'false' }}
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            js:
+              - 'js/**/*.js'
+              - '.github/scripts/**/*.mjs'
+              - '.github/workflows/ci.yml'
+            deno:
+              - 'supabase/functions/slack-bridge/**'
+              - '.github/workflows/ci.yml'
+            sql:
+              - 'supabase/migrations/schema-v5-slack.sql'
+              - 'supabase/migrations/schema-v6-slack-bridge-hardening.sql'
+              - 'supabase/migrations/schema-v7-slack-channel-isolation.sql'
+              - 'supabase/tests/slack-channel-isolation.sql'
+              - 'supabase/tests/README.md'
+              - '.github/workflows/ci.yml'
+
+      - name: 輸出最終判定
+        id: resolve
+        run: |
+          if [ "${{ steps.mode.outputs.run_all }}" = "true" ]; then
+            echo "run_js=true" >> "$GITHUB_OUTPUT"
+            echo "run_deno=true" >> "$GITHUB_OUTPUT"
+            echo "run_sql=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_js=${{ steps.filter.outputs.js }}" >> "$GITHUB_OUTPUT"
+            echo "run_deno=${{ steps.filter.outputs.deno }}" >> "$GITHUB_OUTPUT"
+            echo "run_sql=${{ steps.filter.outputs.sql }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  js_syntax:
+    name: CI | JS 語法檢查
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.run_js == 'true' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -19,11 +84,18 @@ jobs:
         with:
           node-version: '20'
 
-      - name: JS 語法檢查
+      - name: CI 診斷（版本）
+        run: |
+          mkdir -p ci-artifacts
+          node --version | tee ci-artifacts/node-version.txt
+
+      - name: JS 語法逐檔檢查
         shell: bash
         run: |
-          node --version
+          set -euo pipefail
+          mkdir -p ci-artifacts
           shopt -s nullglob
+          : > ci-artifacts/js-syntax.log
           for pattern in 'js/*.js' '.github/scripts/*.mjs'; do
             files=( $pattern )
             if (( ${#files[@]} == 0 )); then
@@ -31,25 +103,228 @@ jobs:
               exit 1
             fi
             for f in "${files[@]}"; do
-              echo "Checking $f"
-              if ! node --check "$f"; then
+              echo "Checking $f" | tee -a ci-artifacts/js-syntax.log
+              if ! node --check "$f" 2>&1 | tee -a ci-artifacts/js-syntax.log; then
                 echo "::error file=$f::JavaScript syntax check failed"
                 exit 1
               fi
             done
           done
 
+      - name: 上傳失敗診斷
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-js-diagnostics
+          path: ci-artifacts/
+
+  deno_quality:
+    name: CI | Deno 品質檢查
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.run_deno == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 快取 Node 套件下載
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-npm-${{ hashFiles('supabase/functions/slack-bridge/deno.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-npm-
+
       - uses: denoland/setup-deno@v2
-        id: deno
         with:
           deno-version: v2.x
 
-      - name: Deno 版本
-        run: deno --version
+      - name: 快取 Deno
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/deno
+          key: ${{ runner.os }}-deno-${{ hashFiles('supabase/functions/slack-bridge/deno.json') }}
+          restore-keys: |
+            ${{ runner.os }}-deno-
+
+      - name: CI 診斷（版本）
+        run: |
+          mkdir -p ci-artifacts
+          node --version | tee ci-artifacts/node-version.txt
+          deno --version | tee ci-artifacts/deno-version.txt
+
+      - name: Deno lint
+        run: |
+          deno lint supabase/functions/slack-bridge/ 2>&1 | tee ci-artifacts/deno-lint.log
+
+      - name: Deno check
+        run: |
+          deno check supabase/functions/slack-bridge/index.ts 2>&1 | tee ci-artifacts/deno-check.log
+
+      - name: 上傳失敗診斷
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-deno-quality-diagnostics
+          path: ci-artifacts/
+
+  deno_tests:
+    name: CI | Deno 測試
+    runs-on: ubuntu-latest
+    needs: [changes, deno_quality]
+    if: ${{ needs.changes.outputs.run_deno == 'true' && !cancelled() }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 快取 Node 套件下載
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-npm-${{ hashFiles('supabase/functions/slack-bridge/deno.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-npm-
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: 快取 Deno
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/deno
+          key: ${{ runner.os }}-deno-${{ hashFiles('supabase/functions/slack-bridge/deno.json') }}
+          restore-keys: |
+            ${{ runner.os }}-deno-
+
+      - name: CI 診斷（版本）
+        run: |
+          mkdir -p ci-artifacts
+          node --version | tee ci-artifacts/node-version.txt
+          deno --version | tee ci-artifacts/deno-version.txt
 
       - name: slack-bridge lib 單元測試
-        run: deno test supabase/functions/slack-bridge/lib_test.ts
+        id: lib_test
+        continue-on-error: true
+        run: |
+          deno test supabase/functions/slack-bridge/lib_test.ts 2>&1 | tee ci-artifacts/deno-lib-test.log
 
       - name: slack-bridge verify 單元測試
-        if: ${{ !cancelled() && steps.deno.outcome == 'success' }}
-        run: deno test supabase/functions/slack-bridge/verify_test.ts
+        id: verify_test
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        run: |
+          deno test supabase/functions/slack-bridge/verify_test.ts 2>&1 | tee ci-artifacts/deno-verify-test.log
+
+      - name: 彙總測試結果
+        if: ${{ !cancelled() }}
+        run: |
+          if [ "${{ steps.lib_test.outcome }}" != "success" ]; then
+            echo "::error::slack-bridge lib test failed"
+            exit 1
+          fi
+          if [ "${{ steps.verify_test.outcome }}" != "success" ]; then
+            echo "::error::slack-bridge verify test failed"
+            exit 1
+          fi
+
+      - name: 上傳失敗診斷
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-deno-test-diagnostics
+          path: ci-artifacts/
+
+  sql_regression:
+    name: CI | SQL 回歸測試
+    runs-on: ubuntu-latest
+    needs: changes
+    if: ${{ needs.changes.outputs.run_sql == 'true' }}
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PGHOST: localhost
+      PGPORT: '5432'
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 初始化 SQL 測試前置（角色/函式/extension）
+        run: |
+          psql -X -v ON_ERROR_STOP=1 <<'SQL'
+          create extension if not exists pgcrypto;
+
+          do $$
+          begin
+            if not exists (select 1 from pg_roles where rolname = 'anon') then
+              create role anon;
+            end if;
+            if not exists (select 1 from pg_roles where rolname = 'authenticated') then
+              create role authenticated;
+            end if;
+            if not exists (select 1 from pg_roles where rolname = 'service_role') then
+              create role service_role;
+            end if;
+          end
+          $$;
+
+          create schema if not exists auth;
+
+          create or replace function auth.uid()
+          returns uuid
+          language sql
+          stable
+          as $$ select null::uuid $$;
+
+          create or replace function public.is_admin()
+          returns boolean
+          language sql
+          stable
+          as $$ select true $$;
+
+          create or replace function public.set_updated_at()
+          returns trigger
+          language plpgsql
+          as $$
+          begin
+            new.updated_at = now();
+            return new;
+          end;
+          $$;
+          SQL
+
+      - name: 執行 SQL migration 與回歸測試
+        run: |
+          mkdir -p ci-artifacts
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/schema-v5-slack.sql 2>&1 | tee ci-artifacts/sql-v5.log
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/schema-v6-slack-bridge-hardening.sql 2>&1 | tee ci-artifacts/sql-v6.log
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/schema-v7-slack-channel-isolation.sql 2>&1 | tee ci-artifacts/sql-v7.log
+          psql -X -v ON_ERROR_STOP=1 -f supabase/migrations/schema-v7-slack-channel-isolation.sql 2>&1 | tee -a ci-artifacts/sql-v7.log
+          psql -X -v ON_ERROR_STOP=1 -f supabase/tests/slack-channel-isolation.sql 2>&1 | tee ci-artifacts/sql-regression.log
+
+      - name: 上傳失敗診斷
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-sql-diagnostics
+          path: ci-artifacts/
