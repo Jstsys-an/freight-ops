@@ -1,4 +1,4 @@
-# 一次性：刪除倉庫公開期間留下的所有 backup-* 備份 release 與 tag。
+# 一次性：刪除倉庫公開期間留下的 5 份備份 release 與 tag。
 # 只能手動觸發，且要輸入 DELETE 才會執行。用完會在下一個 PR 移除。
 name: 刪除公開備份（一次性）
 
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: '輸入 DELETE 確認刪除全部 backup-* release（不能復原）'
+        description: '輸入 DELETE 確認刪除公開期間的 5 份備份（不能復原）'
         required: true
 
 permissions:
@@ -17,20 +17,17 @@ jobs:
     if: ${{ inputs.confirm == 'DELETE' }}
     runs-on: ubuntu-latest
     steps:
-      - name: 刪除所有 backup-* release 與 tag
+      # 只刪倉庫公開期間產生的這 5 份；改成私有後產生的新備份不受影響。
+      - name: 刪除公開期間的 5 份備份 release 與 tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eo pipefail
-          tags=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName \
-            --jq '.[] | select(.tagName | startswith("backup-")) | .tagName')
-          echo "要刪除的備份："
-          echo "$tags"
-          for tag in $tags; do
-            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
-            echo "已刪除 $tag"
+          for tag in backup-2026-09-17-1 backup-2026-09-20-2 backup-2026-09-27-3 backup-2026-10-04-4 backup-2026-10-11-5; do
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              echo "已刪除 $tag"
+            else
+              echo "$tag 已不存在，略過"
+            fi
           done
-          left=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName \
-            --jq '[.[] | select(.tagName | startswith("backup-"))] | length')
-          echo "剩下 backup-* release：$left"
-          test "$left" -eq 0
