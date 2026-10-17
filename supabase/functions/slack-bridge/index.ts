@@ -211,7 +211,7 @@ async function callOpenAI(history: Turn[]): Promise<string> {
 async function callAnthropic(history: Turn[]): Promise<string> {
   const res = await anthropic.beta.messages.create({
     model: ENV.anthropicModel,
-    max_tokens: 1024,
+    max_tokens: 4096,
     betas: ["server-side-fallback-2026-07-01"],
     fallbacks: "default",
     thinking: { type: "adaptive" },
@@ -228,11 +228,18 @@ async function callAnthropic(history: Turn[]): Promise<string> {
     return `（Claude 這題婉拒回答：${why}）`;
   }
 
-  return res.content
+  const text = res.content
     .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
     .map((b) => b.text)
     .join("\n")
     .trim();
+
+  // 思考也算在 max_tokens 裡：用完時文字可能只剩半句或是空的，要註明而不是當成正常回覆。
+  if (res.stop_reason === "max_tokens") {
+    return text ? `${text}（回覆過長被截斷）` : "（Claude 這次沒有產生回覆：超過長度上限）";
+  }
+
+  return text;
 }
 
 async function callProvider(who: Provider, history: Turn[]): Promise<string> {
