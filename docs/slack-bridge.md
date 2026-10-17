@@ -145,6 +145,7 @@ supabase secrets set \
 | `ANTHROPIC_MODEL` | 否 | `claude-opus-5-5` | |
 | `GPT_ICON` / `CLAUDE_ICON` | 否 | `:robot_face:` / `:sparkles:` | emoji 或圖片 URL（`https://` 開頭自動改用 `icon_url`） |
 | `MAX_ROUNDS` | 否 | `6` | 正整數；建立新串時寫進 `slack_threads.max_rounds` |
+| `RUN_BUDGET_SECONDS` | 否 | `120` | 正整數；一次背景執行的總時間上限（秒）。剩不到 10 秒就不開新的一句，貼「⏸ 這次執行時間已到，先暫停」並釋放鎖；在討論串回覆或 @ 機器人就會接著聊。要低於 Edge Function 背景工作的時間上限（免費方案約 150 秒） |
 
 **環境變數驗證規則**（`lib.ts`）：沒設、空白、或以 `#` 開頭的值一律視為未設定、用預設值；`MAX_ROUNDS` 必須是正整數（`0`、負數、小數、文字都會退回預設 6）；`OPENAI_REASONING_EFFORT` 不在清單內會退回 `low`。必填的密鑰缺了，函式啟動時直接 throw，`supabase functions logs slack-bridge` 會看到「缺少環境變數 …」。
 
@@ -217,8 +218,10 @@ returning *;
 
 ### 模型呼叫
 
-- OpenAI：Responses API（`openai.responses.create`），`max_output_tokens: 1024`，`reasoning.effort` 由 `OPENAI_REASONING_EFFORT` 決定。
-- Anthropic：`anthropic.beta.messages.create`，`max_tokens: 4096`（思考也算在內），`thinking: { type: "adaptive" }`，`output_config: { effort: "low" }`，並開啟 server-side fallback（`betas: ["server-side-fallback-2026-07-01"]` + `fallbacks: "default"`）；回應先看 `stop_reason === "refusal"`，婉拒時貼「（Claude 這題婉拒回答：…）」而不是空訊息。`stop_reason === "max_tokens"` 時在尾端註明「（回覆過長被截斷）」，沒有文字就貼「（Claude 這次沒有產生回覆：超過長度上限）」。
+- OpenAI：Responses API（`openai.responses.create`），`max_output_tokens: 1024`（推理也算在內），`reasoning.effort` 由 `OPENAI_REASONING_EFFORT` 決定。`status === "incomplete"` 時註明「（回覆過長被截斷）」或「（回覆未完成：原因）」。
+- Anthropic：`anthropic.beta.messages.create`，`max_tokens: 4096`（思考也算在內），`thinking: { type: "adaptive" }`，`output_config: { effort: "low" }`，並開啟 server-side fallback（`betas: ["server-side-fallback-2026-07-01"]` + `fallbacks: "default"`）；回應先看 `stop_reason === "refusal"`，婉拒時貼「（Claude 這題婉拒回答：…）」而不是空訊息。`stop_reason` 是 `max_tokens` 或 `model_context_window_exceeded` 時註明「（回覆過長被截斷）」。
+- 婉拒、截斷這類說明**只貼到 Slack、另起一行**，不存進 `slack_threads.history`，之後兩個模型不會把說明當成對話內容；完全沒有文字時歷史存「（沒有產生內容）」以維持輪次。
+- 每次模型呼叫都帶 `timeout` = 這次執行剩下的時間（見 `RUN_BUDGET_SECONDS`）並關掉 SDK 自動重試（`maxRetries: 0`，否則每次重試都會重算 timeout），逾時或失敗會貼「⚠️ … 回應失敗」，在討論串回覆或 @ 機器人即可重試。
 - 兩邊都是「系統指示 + 一則 user 訊息（整串逐字稿）」的寫法，不會踩到 user/assistant 必須交替的限制。
 
 ### agent_alerts 側寫
@@ -250,7 +253,7 @@ steps:
   到達 `MAX_ROUNDS` 就會自動停手並貼通知。要繼續請調高 `MAX_ROUNDS`（只影響新串）、直接改該筆的
   `slack_threads.max_rounds`，或重開新討論串。
 - 函式會用 `SLACK_SIGNING_SECRET` 驗證每個請求的簽章（`verify.ts`），並拒絕時間戳超過 5 分鐘的請求（擋重放）。
-- GPT 每句最多 1024 token、Claude 最多 4096 token（含思考），推理強度都是 low；預設模型是兩家的旗艦等級，要省就改 `OPENAI_MODEL` / `ANTHROPIC_MODEL`。
+- GPT 每句最多 1024 token、Claude 最多 4096 token（兩者都含推理／思考），推理強度都是 low；預設模型是兩家的旗艦等級，要省就改 `OPENAI_MODEL` / `ANTHROPIC_MODEL`。
 - 所有密鑰都存在 Supabase Edge Secrets，不在本 repo 裡；`.env` 已被 `.gitignore` 排除。
 
 ## 已知限制

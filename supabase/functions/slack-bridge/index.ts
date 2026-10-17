@@ -21,13 +21,24 @@
 //   ANTHROPIC_API_KEY / ANTHROPIC_MODEL（預設 claude-opus-5-5）
 //   GPT_ICON / CLAUDE_ICON（emoji 或圖片 URL）
 //   MAX_ROUNDS（預設 6）
+//   RUN_BUDGET_SECONDS（預設 120；一次背景執行的總時間上限，到了就先暫停、釋放鎖）
 //   SUPABASE_URL / service role key（Edge Function 環境內建，程式會自動找；見 serviceRoleKey）
 // ============================================================
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import { createClient } from "@supabase/supabase-js";
 import { verifySlackSignature } from "./verify.ts";
-import { envChoice, envPositiveInt, envString, iconField, isHandledEvent, stripMentions } from "./lib.ts";
+import {
+  envChoice,
+  envPositiveInt,
+  envString,
+  iconField,
+  isHandledEvent,
+  type ProviderReply,
+  remainingMs,
+  slackText,
+  stripMentions,
+} from "./lib.ts";
 
 // Supabase Edge Runtime 提供的全域物件：讓回應送出後背景工作繼續跑。
 // 本機 `supabase functions serve` 預設回應完就關閉實例，見 docs/slack-bridge.md「本機測試」。
@@ -77,6 +88,8 @@ const ENV = {
   gptIcon: envString(Deno.env.get("GPT_ICON"), ":robot_face:"),
   claudeIcon: envString(Deno.env.get("CLAUDE_ICON"), ":sparkles:"),
   maxRounds: envPositiveInt(Deno.env.get("MAX_ROUNDS"), 6),
+  // Edge Function 背景工作有執行時間上限，被砍掉時 finally 不會跑、鎖會卡住；先在上限前自己停。
+  runBudgetMs: envPositiveInt(Deno.env.get("RUN_BUDGET_SECONDS"), 120) * 1000,
   supabaseUrl: mustEnv("SUPABASE_URL"),
   supabaseServiceKey: serviceRoleKey(),
 };
@@ -194,7 +207,7 @@ function systemPrompt(me: Provider): string {
 }
 
 /** OpenAI（Responses API） */
-async function callOpenAI(history: Turn[]): Promise<string> {
+async function callOpenAI(history: Turn[], timeout: number): Promise<ProviderReply> {
   const res = await openai.responses.create({
     model: ENV.openaiModel,
     instructions: systemPrompt("gpt"),
@@ -203,12 +216,19 @@ async function callOpenAI(history: Turn[]): Promise<string> {
     ...(ENV.openaiReasoningEffort !== "off"
       ? { reasoning: { effort: ENV.openaiReasoningEffort as OpenAI.ReasoningEffort } }
       : {}),
-  });
-  return (res.output_text ?? "").trim();
+  }, { timeout, maxRetries: 0 });
+  const text = (res.output_text ?? "").trim();
+
+  // 推理也算在 max_output_tokens 裡：沒講完時要註明，而不是當成完整回覆。
+  if (res.status === "incomplete") {
+    const reason = res.incomplete_details?.reason;
+    return { text, note: reason === "max_output_tokens" ? "（回覆過長被截斷）" : `（回覆未完成：${reason ?? "原因不明"}）` };
+  }
+  return { text };
 }
 
 /** Anthropic（Messages API，beta：server-side fallback） */
-async function callAnthropic(history: Turn[]): Promise<string> {
+async function callAnthropic(history: Turn[], timeout: number): Promise<ProviderReply> {
   const res = await anthropic.beta.messages.create({
     model: ENV.anthropicModel,
     max_tokens: 4096,
@@ -220,12 +240,12 @@ async function callAnthropic(history: Turn[]): Promise<string> {
     messages: [
       { role: "user", content: `${buildTranscript(history)}\n\nClaude 的回應：` },
     ],
-  });
+  }, { timeout, maxRetries: 0 });
 
   // 先看 stop_reason 再讀 content：婉拒時 content 可能是空的或只有片段。
   if (res.stop_reason === "refusal") {
     const why = res.stop_details?.explanation ?? "安全政策";
-    return `（Claude 這題婉拒回答：${why}）`;
+    return { text: "", note: `（Claude 這題婉拒回答：${why}）` };
   }
 
   const text = res.content
@@ -234,16 +254,15 @@ async function callAnthropic(history: Turn[]): Promise<string> {
     .join("\n")
     .trim();
 
-  // 思考也算在 max_tokens 裡：用完時文字可能只剩半句或是空的，要註明而不是當成正常回覆。
-  if (res.stop_reason === "max_tokens") {
-    return text ? `${text}（回覆過長被截斷）` : "（Claude 這次沒有產生回覆：超過長度上限）";
+  // 思考也算在 max_tokens 裡；對話太長也會被切。兩種都可能只剩半句或空的，要註明而不是當成正常回覆。
+  if (res.stop_reason === "max_tokens" || res.stop_reason === "model_context_window_exceeded") {
+    return { text, note: "（回覆過長被截斷）" };
   }
-
-  return text;
+  return { text };
 }
 
-async function callProvider(who: Provider, history: Turn[]): Promise<string> {
-  return who === "gpt" ? await callOpenAI(history) : await callAnthropic(history);
+async function callProvider(who: Provider, history: Turn[], timeout: number): Promise<ProviderReply> {
+  return who === "gpt" ? await callOpenAI(history, timeout) : await callAnthropic(history, timeout);
 }
 
 // ---------- 3. 資料庫（supabase-js，service role 繞過 RLS） ----------
@@ -320,22 +339,29 @@ async function bestEffortAlert(level: string, title: string, body: string): Prom
 // 從目前狀態開始，GPT ↔ Claude 一來一回，直到回合上限。每講一句就貼進 Slack、寫回表。
 // 呼叫端已持有鎖；這裡只管講話。
 async function runConversation(thread: ThreadRow): Promise<void> {
+  const startedAt = Date.now();
   // 一回合 = GPT 講一句 + Claude 講一句。next_turn 從 'claude' 翻回 'gpt' 時 round_count +1。
   while (thread.round_count < thread.max_rounds) {
     const who = thread.next_turn;
-    let reply = "";
+    // 剩不到 10 秒就不開新的一句：先暫停、交給 handleEvent 的 finally 釋放鎖，下次有人說話再接著聊。
+    const timeLeft = remainingMs(startedAt, ENV.runBudgetMs, Date.now());
+    if (timeLeft < 10_000) {
+      await postNotice(thread.channel_id, thread.thread_ts, "⏸ 這次執行時間已到，先暫停。在討論串回覆或 @ 我就會接著繼續。");
+      return;
+    }
+    // SDK 預設失敗會重試、每次重試都重算 timeout，會超出剩餘時間，所以呼叫時關掉重試。
+    let reply: ProviderReply;
     try {
-      reply = await callProvider(who, thread.history);
+      reply = await callProvider(who, thread.history, timeLeft);
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       await postNotice(thread.channel_id, thread.thread_ts, `⚠️ ${IDENTITIES[who].username} 回應失敗：${reason.slice(0, 300)}`);
       await bestEffortAlert("info", "Slack bridge 模型呼叫失敗", `thread_ts=${thread.thread_ts}, who=${who}: ${reason}`);
       return;
     }
-    if (!reply) reply = "（沒有產生內容）";
-
-    await postMessage({ channel: thread.channel_id, thread_ts: thread.thread_ts, text: reply, as: who });
-    thread = await appendTurn(thread.id, { speaker: who, content: reply }, true);
+    // Slack 看得到說明；歷史只存模型真正說的話，免得之後兩個模型把說明當成對話內容。
+    await postMessage({ channel: thread.channel_id, thread_ts: thread.thread_ts, text: slackText(reply), as: who });
+    thread = await appendTurn(thread.id, { speaker: who, content: reply.text || "（沒有產生內容）" }, true);
   }
 
   // 安全閥：到達回合上限，貼一則通知後停手。
