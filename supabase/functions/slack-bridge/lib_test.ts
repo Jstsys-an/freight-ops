@@ -164,7 +164,8 @@ Deno.test("slackText：只有內容 → 原文", () => {
 });
 
 Deno.test("slackText：內容加說明 → 說明另起一行", () => {
-  assertEq(slackText({ text: "```\nconst x =", note: "（回覆過長被截斷）" }), "```\nconst x =\n（回覆過長被截斷）", "內容＋說明");
+  assertEq(slackText({ text: "```\nconst x =", note: "（回覆過長被截斷）" }), "```\nconst x =\n```\n（回覆過長被截斷）", "內容＋說明會先閉合程式碼區塊");
+  assertEq(slackText({ text: "```\nconst x =\n```", note: "（回覆過長被截斷）" }), "```\nconst x =\n```\n（回覆過長被截斷）", "已閉合的程式碼區塊不重複補上");
 });
 
 Deno.test("slackText：只有說明 → 說明", () => {

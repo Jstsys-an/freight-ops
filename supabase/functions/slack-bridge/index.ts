@@ -94,6 +94,31 @@ const ENV = {
   supabaseServiceKey: serviceRoleKey(),
 };
 
+interface RunDeadline {
+  startedAt: number;
+  budgetMs: number;
+}
+
+const CLEANUP_RESERVE_MS = 10_000;
+const IO_TIMEOUT_MS = 10_000;
+const MODEL_FOLLOWUP_RESERVE_MS = IO_TIMEOUT_MS * 2;
+const NOTICE_TIMEOUT_MS = 3_000;
+const ALERT_TIMEOUT_MS = 2_000;
+const RELEASE_TIMEOUT_MS = 3_000;
+
+function requestTimeoutMs(
+  deadline: RunDeadline,
+  reserveMs = 0,
+  maxTimeoutMs = Number.POSITIVE_INFINITY,
+): number {
+  const timeoutMs = Math.min(
+    remainingMs(deadline.startedAt, deadline.budgetMs, Date.now()) - reserveMs,
+    maxTimeoutMs,
+  );
+  if (timeoutMs <= 0) throw new Error("Slack bridge 執行時間已到");
+  return timeoutMs;
+}
+
 const openai = new OpenAI({ apiKey: ENV.openaiApiKey });
 const anthropic = new Anthropic({ apiKey: ENV.anthropicApiKey });
 const supabase = createClient(ENV.supabaseUrl, ENV.supabaseServiceKey, {
@@ -156,7 +181,12 @@ interface PostMessageOptions {
 }
 
 /** chat.postMessage；需要 scope chat:write，自訂名字／頭像另需 chat:write.customize */
-async function postMessage(opts: PostMessageOptions): Promise<string> {
+async function postMessage(
+  opts: PostMessageOptions,
+  deadline: RunDeadline,
+  reserveMs = CLEANUP_RESERVE_MS,
+  maxTimeoutMs = IO_TIMEOUT_MS,
+): Promise<string> {
   const body: Record<string, unknown> = {
     channel: opts.channel,
     thread_ts: opts.thread_ts,
@@ -173,6 +203,7 @@ async function postMessage(opts: PostMessageOptions): Promise<string> {
       "Content-Type": "application/json; charset=utf-8",
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(requestTimeoutMs(deadline, reserveMs, maxTimeoutMs)),
   });
   const data = await res.json() as { ok: boolean; ts?: string; error?: string };
   if (!data.ok) throw new Error(`Slack chat.postMessage 失敗：${data.error ?? "unknown"}`);
@@ -180,9 +211,9 @@ async function postMessage(opts: PostMessageOptions): Promise<string> {
 }
 
 /** 貼錯誤／提示訊息；連貼文都失敗就只記 log，不再往外丟 */
-async function postNotice(channel: string, threadTs: string, text: string): Promise<void> {
+async function postNotice(channel: string, threadTs: string, text: string, deadline: RunDeadline): Promise<void> {
   try {
-    await postMessage({ channel, thread_ts: threadTs, text });
+    await postMessage({ channel, thread_ts: threadTs, text }, deadline, 0, NOTICE_TIMEOUT_MS);
   } catch (err) {
     console.error("slack-bridge：通知訊息發不出去：", err);
   }
@@ -291,13 +322,18 @@ interface AcquireResult {
  * 拿不到會回 busy（別的實例正在處理）/ capped（已達上限）/ missing（串不存在且不建）。
  * p_create = true 時，串不存在會先建一筆（round_count 0、max_rounds = MAX_ROUNDS）。
  */
-async function acquireThread(channel: string, threadTs: string, create: boolean): Promise<AcquireResult> {
+async function acquireThread(
+  channel: string,
+  threadTs: string,
+  create: boolean,
+  deadline: RunDeadline,
+): Promise<AcquireResult> {
   const { data, error } = await supabase.rpc("slack_thread_acquire", {
     p_channel: channel,
     p_thread_ts: threadTs,
     p_max_rounds: ENV.maxRounds,
     p_create: create,
-  });
+  }).abortSignal(AbortSignal.timeout(requestTimeoutMs(deadline, CLEANUP_RESERVE_MS, IO_TIMEOUT_MS)));
   if (error) throw new Error(`slack_thread_acquire 失敗：${error.message}`);
   return data as AcquireResult;
 }
@@ -306,30 +342,43 @@ async function acquireThread(channel: string, threadTs: string, create: boolean)
  * 原子 append 一則到 history；advance = true 時同時翻 next_turn，
  * 翻回 gpt 代表一回合結束，round_count +1（都在 SQL function slack_thread_append 內一次做完）。
  */
-async function appendTurn(threadId: string, turn: Turn, advance: boolean): Promise<ThreadRow> {
+async function appendTurn(
+  threadId: string,
+  turn: Turn,
+  advance: boolean,
+  deadline: RunDeadline,
+): Promise<ThreadRow> {
   const { data, error } = await supabase.rpc("slack_thread_append", {
     p_id: threadId,
     p_turn: turn,
     p_advance: advance,
-  });
+  }).abortSignal(AbortSignal.timeout(requestTimeoutMs(deadline, CLEANUP_RESERVE_MS, IO_TIMEOUT_MS)));
   if (error) throw new Error(`slack_thread_append 失敗：${error.message}`);
   return data as ThreadRow;
 }
 
 /** 釋放鎖（processing_since = null）。流程結束（含錯誤）一定呼叫。 */
-async function releaseThread(threadId: string): Promise<void> {
+async function releaseThread(threadId: string, deadline: RunDeadline): Promise<void> {
   const { error } = await supabase
     .from("slack_threads")
     .update({ processing_since: null })
-    .eq("id", threadId);
+    .eq("id", threadId)
+    .abortSignal(AbortSignal.timeout(requestTimeoutMs(deadline, 0, RELEASE_TIMEOUT_MS)));
   if (error) console.error("slack-bridge：釋放鎖失敗：", error.message);
 }
 
 // ---------- 4. agent_alerts 側寫（best-effort，失敗不影響主流程） ----------
 // 比照 scripts/notify.ps1 寫入既有的 agent_alerts 表，讓活動出現在網站「執行紀錄」頁。
-async function bestEffortAlert(level: string, title: string, body: string): Promise<void> {
+async function bestEffortAlert(
+  level: string,
+  title: string,
+  body: string,
+  deadline: RunDeadline,
+): Promise<void> {
   try {
-    await supabase.from("agent_alerts").insert({ level, title, body, session: "slack-bridge" });
+    await supabase.from("agent_alerts")
+      .insert({ level, title, body, session: "slack-bridge" })
+      .abortSignal(AbortSignal.timeout(requestTimeoutMs(deadline, 0, ALERT_TIMEOUT_MS)));
   } catch {
     // 側寫失敗就算了，不讓它拖垮 Slack 對話。
   }
@@ -338,30 +387,33 @@ async function bestEffortAlert(level: string, title: string, body: string): Prom
 // ---------- 5. 對話主迴圈 ----------
 // 從目前狀態開始，GPT ↔ Claude 一來一回，直到回合上限。每講一句就貼進 Slack、寫回表。
 // 呼叫端已持有鎖；這裡只管講話。
-async function runConversation(thread: ThreadRow): Promise<void> {
-  const startedAt = Date.now();
+async function runConversation(thread: ThreadRow, deadline: RunDeadline): Promise<void> {
   // 一回合 = GPT 講一句 + Claude 講一句。next_turn 從 'claude' 翻回 'gpt' 時 round_count +1。
   while (thread.round_count < thread.max_rounds) {
     const who = thread.next_turn;
-    // 剩不到 10 秒就不開新的一句：先暫停、交給 handleEvent 的 finally 釋放鎖，下次有人說話再接著聊。
-    const timeLeft = remainingMs(startedAt, ENV.runBudgetMs, Date.now());
-    if (timeLeft < 10_000) {
-      await postNotice(thread.channel_id, thread.thread_ts, "⏸ 這次執行時間已到，先暫停。在討論串回覆或 @ 我就會接著繼續。");
+    // 剩不到 30 秒就不開新的一句：留時間給回覆寫入、通知與釋放鎖。
+    const timeLeft = remainingMs(deadline.startedAt, deadline.budgetMs, Date.now());
+    if (timeLeft <= CLEANUP_RESERVE_MS + MODEL_FOLLOWUP_RESERVE_MS) {
+      await postNotice(thread.channel_id, thread.thread_ts, "⏸ 這次執行時間已到，先暫停。在討論串回覆或 @ 我就會接著繼續。", deadline);
       return;
     }
     // SDK 預設失敗會重試、每次重試都重算 timeout，會超出剩餘時間，所以呼叫時關掉重試。
     let reply: ProviderReply;
     try {
-      reply = await callProvider(who, thread.history, timeLeft);
+      reply = await callProvider(
+        who,
+        thread.history,
+        requestTimeoutMs(deadline, CLEANUP_RESERVE_MS + MODEL_FOLLOWUP_RESERVE_MS),
+      );
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
-      await postNotice(thread.channel_id, thread.thread_ts, `⚠️ ${IDENTITIES[who].username} 回應失敗：${reason.slice(0, 300)}`);
-      await bestEffortAlert("info", "Slack bridge 模型呼叫失敗", `thread_ts=${thread.thread_ts}, who=${who}: ${reason}`);
+      await postNotice(thread.channel_id, thread.thread_ts, `⚠️ ${IDENTITIES[who].username} 回應失敗：${reason.slice(0, 300)}`, deadline);
+      await bestEffortAlert("info", "Slack bridge 模型呼叫失敗", `thread_ts=${thread.thread_ts}, who=${who}: ${reason}`, deadline);
       return;
     }
     // Slack 看得到說明；歷史只存模型真正說的話，免得之後兩個模型把說明當成對話內容。
-    await postMessage({ channel: thread.channel_id, thread_ts: thread.thread_ts, text: slackText(reply), as: who });
-    thread = await appendTurn(thread.id, { speaker: who, content: reply.text || "（沒有產生內容）" }, true);
+    await postMessage({ channel: thread.channel_id, thread_ts: thread.thread_ts, text: slackText(reply), as: who }, deadline);
+    thread = await appendTurn(thread.id, { speaker: who, content: reply.text || "（沒有產生內容）" }, true, deadline);
   }
 
   // 安全閥：到達回合上限，貼一則通知後停手。
@@ -369,12 +421,13 @@ async function runConversation(thread: ThreadRow): Promise<void> {
     thread.channel_id,
     thread.thread_ts,
     `🛑 回合上限已達（${thread.max_rounds} 回合），已停止自動對話。需要繼續請調整 MAX_ROUNDS 或重開討論串。`,
+    deadline,
   );
-  await bestEffortAlert("info", "Slack bridge 回合上限已達", `thread_ts=${thread.thread_ts}, rounds=${thread.round_count}`);
+  await bestEffortAlert("info", "Slack bridge 回合上限已達", `thread_ts=${thread.thread_ts}, rounds=${thread.round_count}`, deadline);
 }
 
 // ---------- 6. 事件處理（背景執行） ----------
-async function handleEvent(event: SlackEvent): Promise<void> {
+async function handleEvent(event: SlackEvent, deadline: RunDeadline): Promise<void> {
   const channel = event.channel ?? "";
   // 用討論串根訊息的 ts 當鍵；若訊息本身就是根訊息，thread_ts 可能缺省，退回 ts。
   const threadTs = event.thread_ts || event.ts || "";
@@ -383,29 +436,29 @@ async function handleEvent(event: SlackEvent): Promise<void> {
   const isMention = event.type === "app_mention";
 
   // 只在「被 @ 提到機器人」時才開新串，避免機器人對所有訊息都插話。
-  const acquired = await acquireThread(channel, threadTs, isMention);
+  const acquired = await acquireThread(channel, threadTs, isMention, deadline);
   if (acquired.status === "missing") return;
   if (acquired.status === "busy") {
-    await postNotice(channel, threadTs, "⏳ 這個討論串正在處理中，請稍候再試。");
+    await postNotice(channel, threadTs, "⏳ 這個討論串正在處理中，請稍候再試。", deadline);
     return;
   }
   if (acquired.status === "capped") {
-    await postNotice(channel, threadTs, `🛑 這個討論串已達回合上限（${acquired.thread?.max_rounds ?? ENV.maxRounds} 回合）。`);
+    await postNotice(channel, threadTs, `🛑 這個討論串已達回合上限（${acquired.thread?.max_rounds ?? ENV.maxRounds} 回合）。`, deadline);
     return;
   }
 
   let thread = acquired.thread!;
   try {
     // 把人類這句話加進歷史（不翻 next_turn）。
-    if (userText) thread = await appendTurn(thread.id, { speaker: "human", content: userText }, false);
-    await runConversation(thread);
+    if (userText) thread = await appendTurn(thread.id, { speaker: "human", content: userText }, false, deadline);
+    await runConversation(thread, deadline);
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     console.error("slack-bridge 錯誤：", err);
-    await postNotice(channel, threadTs, `⚠️ bridge 錯誤：${reason.slice(0, 300)}`);
-    await bestEffortAlert("info", "Slack bridge 背景處理失敗", `thread_ts=${threadTs}: ${reason}`);
+    await postNotice(channel, threadTs, `⚠️ bridge 錯誤：${reason.slice(0, 300)}`, deadline);
+    await bestEffortAlert("info", "Slack bridge 背景處理失敗", `thread_ts=${threadTs}: ${reason}`, deadline);
   } finally {
-    await releaseThread(thread.id);
+    await releaseThread(thread.id, deadline);
   }
 }
 
@@ -457,9 +510,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
   if (event.channel && event.ts && !(await markOnce(`msg:${event.channel}:${event.ts}`))) return new Response("ok");
 
   // 先回 200，實際工作丟背景
-  const pending = runInBackground(() =>
-    handleEvent(event).catch((err) => bestEffortAlert("info", "Slack bridge 背景處理失敗", String(err)))
-  );
+  const pending = runInBackground(() => {
+    const deadline = { startedAt: Date.now(), budgetMs: ENV.runBudgetMs };
+    return handleEvent(event, deadline).catch((err) =>
+      bestEffortAlert("info", "Slack bridge 背景處理失敗", String(err), deadline)
+    );
+  });
   if (pending) await pending; // 只有在沒有 EdgeRuntime 的環境才會走到這
   return new Response("ok");
 });

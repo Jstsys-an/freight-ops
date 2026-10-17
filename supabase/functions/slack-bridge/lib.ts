@@ -86,7 +86,10 @@ export interface ProviderReply {
 export function slackText(reply: ProviderReply): string {
   const text = reply.text.trim();
   const note = (reply.note ?? "").trim();
-  if (text && note) return `${text}\n${note}`;
+  if (text && note) {
+    const displayText = (text.match(/```/g)?.length ?? 0) % 2 ? `${text}\n\`\`\`` : text;
+    return `${displayText}\n${note}`;
+  }
   return text || note || "（沒有產生內容）";
 }
 

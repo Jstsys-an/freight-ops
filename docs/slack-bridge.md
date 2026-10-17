@@ -145,7 +145,7 @@ supabase secrets set \
 | `ANTHROPIC_MODEL` | 否 | `claude-opus-5-5` | |
 | `GPT_ICON` / `CLAUDE_ICON` | 否 | `:robot_face:` / `:sparkles:` | emoji 或圖片 URL（`https://` 開頭自動改用 `icon_url`） |
 | `MAX_ROUNDS` | 否 | `6` | 正整數；建立新串時寫進 `slack_threads.max_rounds` |
-| `RUN_BUDGET_SECONDS` | 否 | `120` | 正整數；一次背景執行的總時間上限（秒）。剩不到 10 秒就不開新的一句，貼「⏸ 這次執行時間已到，先暫停」並釋放鎖；在討論串回覆或 @ 機器人就會接著聊。要低於 Edge Function 背景工作的時間上限（免費方案約 150 秒） |
+| `RUN_BUDGET_SECONDS` | 否 | `120` | 正整數；一次背景執行的總時間上限（秒），從取鎖開始計算，包含資料庫、模型與 Slack I/O。每次一般 I/O 最多 10 秒，模型會預留 20 秒供回覆寫入，另留 10 秒供通知及釋放鎖；剩不到 30 秒就不開新的一句，貼「⏸ 這次執行時間已到，先暫停」並釋放鎖；在討論串回覆或 @ 機器人就會接著聊。要低於 Edge Function 背景工作的時間上限（免費方案約 150 秒） |
 
 **環境變數驗證規則**（`lib.ts`）：沒設、空白、或以 `#` 開頭的值一律視為未設定、用預設值；`MAX_ROUNDS` 必須是正整數（`0`、負數、小數、文字都會退回預設 6）；`OPENAI_REASONING_EFFORT` 不在清單內會退回 `low`。必填的密鑰缺了，函式啟動時直接 throw，`supabase functions logs slack-bridge` 會看到「缺少環境變數 …」。
 
@@ -221,7 +221,7 @@ returning *;
 - OpenAI：Responses API（`openai.responses.create`），`max_output_tokens: 1024`（推理也算在內），`reasoning.effort` 由 `OPENAI_REASONING_EFFORT` 決定。`status === "incomplete"` 時註明「（回覆過長被截斷）」或「（回覆未完成：原因）」。
 - Anthropic：`anthropic.beta.messages.create`，`max_tokens: 4096`（思考也算在內），`thinking: { type: "adaptive" }`，`output_config: { effort: "low" }`，並開啟 server-side fallback（`betas: ["server-side-fallback-2026-07-01"]` + `fallbacks: "default"`）；回應先看 `stop_reason === "refusal"`，婉拒時貼「（Claude 這題婉拒回答：…）」而不是空訊息。`stop_reason` 是 `max_tokens` 或 `model_context_window_exceeded` 時註明「（回覆過長被截斷）」。
 - 婉拒、截斷這類說明**只貼到 Slack、另起一行**，不存進 `slack_threads.history`，之後兩個模型不會把說明當成對話內容；完全沒有文字時歷史存「（沒有產生內容）」以維持輪次。
-- 每次模型呼叫都帶 `timeout` = 這次執行剩下的時間（見 `RUN_BUDGET_SECONDS`）並關掉 SDK 自動重試（`maxRetries: 0`，否則每次重試都會重算 timeout），逾時或失敗會貼「⚠️ … 回應失敗」，在討論串回覆或 @ 機器人即可重試。
+- 背景工作從取得處理權前開始共用 `RUN_BUDGET_SECONDS` deadline；模型、Slack 與資料庫請求都使用可取消的剩餘時間上限。模型時間會預留 20 秒供 Slack／DB 寫入、10 秒供通知與鎖釋放，並關掉 SDK 自動重試（`maxRetries: 0`，否則每次重試都會重算 timeout）；逾時或失敗會盡力貼「⚠️ … 回應失敗」，在討論串回覆或 @ 機器人即可重試。
 - 兩邊都是「系統指示 + 一則 user 訊息（整串逐字稿）」的寫法，不會踩到 user/assistant 必須交替的限制。
 
 ### agent_alerts 側寫
