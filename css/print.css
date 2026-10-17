@@ -9,7 +9,7 @@
   body{background:#fff;padding-bottom:0 !important}
   .app,main,#app{background:#fff !important}
   .topbar,nav,.mobnav,.quick-entry,.quickadd,.filters,.actions,
-  .btn,.rowbtn,.bell,.belldrop,.actionbanner,.dropzone,footer,
+  .btn,.rowbtn,.bell,.belldrop,.actionbanner,.movebanner,.dropzone,footer,
   .dashgrid2,.dashgrid3,.cards,.summary .alert,dialog{display:none !important}
 
   .app{display:block !important}

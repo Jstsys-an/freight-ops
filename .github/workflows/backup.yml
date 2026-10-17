@@ -22,6 +22,16 @@ jobs:
   backup:
     runs-on: ubuntu-latest
     steps:
+      # 公開倉庫的 Releases 任何人都能下載，備份裡是全部資料表，所以倉庫不是私有就直接停下。
+      - name: 確認倉庫是私有的
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .private)" != "true" ]; then
+            echo "::error::倉庫目前是公開的，備份會被任何人下載。請先到 Settings → General → Danger Zone 改成 Private。"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
@@ -48,3 +58,14 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "資料庫備份 $DATE" \
             --notes "GitHub Actions 每週自動備份，內含全部資料表 JSON 與 manifest.json（各表筆數、Storage 檔案數）。"
+
+      # 只留最近 8 份（約兩個月），更舊的連同 tag 一起刪掉，避免資料副本越堆越多。
+      - name: 清掉舊備份
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("backup-"))] | sort_by(.createdAt) | reverse | .[8:] | .[].tagName' |
+          while read -r tag; do
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          done
