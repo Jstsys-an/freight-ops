@@ -1,0 +1,101 @@
+# 手動部署 slack-bridge（只在 An 按下 Run workflow 時執行）
+# 需要倉庫 Secret：SUPABASE_ACCESS_TOKEN（Supabase 個人存取權杖）
+# 四個執行用密鑰（SLACK_BOT_TOKEN 等）設在 Supabase Edge Secrets，不在這裡。
+name: deploy-slack-bridge
+
+on:
+  workflow_dispatch:
+    inputs:
+      step:
+        description: "要做哪一段：migrate＝只建資料表、deploy＝只部署函式、all＝兩段都做"
+        required: true
+        default: all
+        type: choice
+        options: [all, migrate, deploy]
+
+concurrency:
+  group: deploy-slack-bridge
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_REF: ekzqrpgrxicyvaqagdjp
+  FUNCTION_URL: https://ekzqrpgrxicyvaqagdjp.supabase.co/functions/v1/slack-bridge
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 檢查權杖
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
+            echo "::error::缺少倉庫 Secret SUPABASE_ACCESS_TOKEN"
+            exit 1
+          fi
+
+      - name: 單元測試（失敗就不部署）
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno test supabase/functions/slack-bridge/lib_test.ts supabase/functions/slack-bridge/verify_test.ts
+
+      - name: 建資料表 v5 → v6 → v7
+        if: inputs.step == 'all' || inputs.step == 'migrate'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          q() {
+            jq -n --arg query "$1" '{query: $query}' |
+              curl -sS --fail-with-body -X POST \
+                "https://api.supabase.com/v1/projects/$PROJECT_REF/database/query" \
+                -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+                -H "Content-Type: application/json" \
+                --data-binary @-
+          }
+          # 已套過 v7 就不能再跑 v6（會把 RPC 改回單欄唯一鍵），只重跑 v7
+          applied=$(q "select to_regclass('public.slack_threads_channel_thread_ts_key') is not null as v7" | jq -r '.[0].v7')
+          if [ "$applied" = "true" ]; then
+            files="schema-v7-slack-channel-isolation.sql"
+            echo "v7 已存在：只重跑 v7（官方註明可重跑）"
+          else
+            files="schema-v5-slack.sql schema-v6-slack-bridge-hardening.sql schema-v7-slack-channel-isolation.sql"
+          fi
+          for f in $files; do
+            echo "▶ $f"
+            q "$(cat "supabase/migrations/$f")" > /dev/null
+          done
+          # 讀回驗證
+          q "select to_regclass('public.slack_threads') is not null as threads,
+                    to_regclass('public.slack_events') is not null as events,
+                    to_regclass('public.slack_threads_channel_thread_ts_key') is not null as v7,
+                    (select count(*) from pg_proc where proname in ('slack_thread_acquire','slack_thread_append')) as rpcs" |
+            jq -e '.[0] | .threads and .events and .v7 and (.rpcs >= 2)'
+
+      - name: 部署函式
+        if: inputs.step == 'all' || inputs.step == 'deploy'
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - if: inputs.step == 'all' || inputs.step == 'deploy'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: supabase functions deploy slack-bridge --project-ref "$PROJECT_REF" --no-verify-jwt
+
+      - name: 讀回驗證（沒簽章的請求應被拒，代表函式已上線且驗簽有作用）
+        if: inputs.step == 'all' || inputs.step == 'deploy'
+        run: |
+          code=$(curl -s -o body.txt -w '%{http_code}' -X POST "$FUNCTION_URL" -d '{}')
+          echo "HTTP $code：$(head -c 200 body.txt)"
+          case "$code" in
+            401) echo "✅ 已上線，驗簽有作用" ;;
+            404) echo "::error::函式不存在，部署沒成功"; exit 1 ;;
+            5*)  echo "::error::函式啟動失敗，多半是 Edge Secrets 沒設齊（看 Supabase 函式 log）"; exit 1 ;;
+            *)   echo "::error::非預期回應"; exit 1 ;;
+          esac
