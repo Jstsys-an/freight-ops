@@ -73,3 +73,29 @@ export function stripMentions(text: string | undefined | null): string {
 export function iconField(icon: string): { icon_url: string } | { icon_emoji: string } {
   return /^https?:\/\//.test(icon) ? { icon_url: icon } : { icon_emoji: icon };
 }
+
+// ---------- 模型回覆 ----------
+
+/** 模型這一輪的結果：text 存進對話歷史；note 只貼到 Slack（截斷、婉拒等說明），不進歷史 */
+export interface ProviderReply {
+  text: string;
+  note?: string;
+}
+
+/** 組出要貼到 Slack 的文字：說明另起一行，避免黏進程式碼區塊；兩者都空就給佔位字 */
+export function slackText(reply: ProviderReply): string {
+  const text = reply.text.trim();
+  const note = (reply.note ?? "").trim();
+  if (text && note) {
+    const displayText = (text.match(/```/g)?.length ?? 0) % 2 ? `${text}\n\`\`\`` : text;
+    return `${displayText}\n${note}`;
+  }
+  return text || note || "（沒有產生內容）";
+}
+
+// ---------- 執行時間 ----------
+
+/** 從 startedAt 起算、總預算 budgetMs，到 now 還剩幾毫秒（不會小於 0） */
+export function remainingMs(startedAt: number, budgetMs: number, now: number): number {
+  return Math.max(0, startedAt + budgetMs - now);
+}

@@ -6,6 +6,8 @@ import {
   envString,
   iconField,
   isHandledEvent,
+  remainingMs,
+  slackText,
   stripMentions,
 } from "./lib.ts";
 
@@ -154,4 +156,31 @@ Deno.test("iconField：URL → icon_url；其他 → icon_emoji", () => {
   assert("icon_url" in u && u.icon_url === "https://example.com/a.png", "url");
   const e = iconField(":robot_face:");
   assert("icon_emoji" in e && e.icon_emoji === ":robot_face:", "emoji");
+});
+
+// ---------- slackText ----------
+Deno.test("slackText：只有內容 → 原文", () => {
+  assertEq(slackText({ text: "你好" }), "你好", "只有內容");
+});
+
+Deno.test("slackText：內容加說明 → 說明另起一行", () => {
+  assertEq(slackText({ text: "```\nconst x =", note: "（回覆過長被截斷）" }), "```\nconst x =\n```\n（回覆過長被截斷）", "內容＋說明會先閉合程式碼區塊");
+  assertEq(slackText({ text: "```\nconst x =\n```", note: "（回覆過長被截斷）" }), "```\nconst x =\n```\n（回覆過長被截斷）", "已閉合的程式碼區塊不重複補上");
+});
+
+Deno.test("slackText：只有說明 → 說明", () => {
+  assertEq(slackText({ text: "", note: "（Claude 這題婉拒回答：x）" }), "（Claude 這題婉拒回答：x）", "只有說明");
+});
+
+Deno.test("slackText：都空 → 佔位字", () => {
+  assertEq(slackText({ text: "  " }), "（沒有產生內容）", "都空");
+});
+
+// ---------- remainingMs ----------
+Deno.test("remainingMs：還有時間 → 剩餘毫秒", () => {
+  assertEq(remainingMs(1000, 5000, 3000), 3000, "剩 3 秒");
+});
+
+Deno.test("remainingMs：已超時 → 0", () => {
+  assertEq(remainingMs(1000, 5000, 9000), 0, "超時");
 });
