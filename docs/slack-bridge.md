@@ -23,6 +23,41 @@ Slack 討論串 ──(@機器人)──▶ Edge Function
 - **安全閥**：每個討論串有回合上限（`MAX_ROUNDS`，預設 6；一回合 = GPT 一句 + Claude 一句）。數到上限就停手、改貼一則「回合上限已達」通知，不會無限對話、無限燒 API 額度。
 - **跨實例鎖**：同一個串同時只會有一個實例在跑，不會兩邊各自算回合、互相覆蓋。
 
+> **現況（2026-10-17）**：決定全部離開 Supabase。這支 bridge 從沒部署過（Edge Functions 0 個，`slack_threads` / `slack_events` 不存在，v5～v7 都沒套用）。新家定案後照下面「平台無關的設計規格」重寫，不硬搬。下面第 1～5 節是 Supabase 版的部署步驟，**僅供參考**。
+
+## 平台無關的設計規格（新家照這段做）
+
+換後端時只換「存放與鎖」的實作；下面四項保證不能少。
+
+**直接沿用、不用改的檔案**：`verify.ts`（Slack 簽章驗證，只用 Web Crypto）、`lib.ts`（純函式：環境變數、事件過濾、文字處理）和兩份 `*_test.ts`。
+**要重寫的**：`index.ts` 裡 5 處資料庫呼叫（`slack_events` insert、`slack_thread_acquire`、`slack_thread_append`、`slack_threads` 釋放鎖、`agent_alerts` insert），以及下面四項在新家的實作。
+
+### 資料模型
+
+```yaml
+thread:                       # 一個 Slack 討論串一筆
+  key: [channel_id, thread_ts]   # 兩欄合起來才唯一（頻道隔離）
+  history: "[{role, name, content}, ...]"
+  next_turn: gpt | claude
+  round_count: 整數，GPT→Claude 算一回合
+  max_rounds: 整數，建串時寫入（預設 MAX_ROUNDS=6）
+  processing_since: 時間或空值      # 鎖
+event:                        # 去重用，保留 7 天即可
+  key: event_id               # Slack event_id，或 msg:<channel>:<ts>
+  received_at: 時間
+```
+
+### 四項保證
+
+| # | 要保證什麼 | 為什麼 | 怎麼測 |
+|---|---|---|---|
+| 1 去重 | 同一個 `event_id` 只處理一次；同一則訊息的 `app_mention` 和 `message` 兩個事件（`event_id` 不同）用 `msg:<channel>:<ts>` 再擋一次 | Slack 3 秒沒拿到 200 就重送；同一則 @ 會發兩個事件 | 同一個 payload 連送兩次，只產生一輪回覆；重送不看 `X-Slack-Retry-Num` 短路，第一次寫失敗時重送要能補上 |
+| 2 串鎖 | 同一串同時只有一個實例在處理；搶鎖、檢查回合上限在**同一個原子操作**裡完成；10 分鐘沒釋放自動過期；結束（含錯誤）一定釋放 | 多實例同時跑會各自算回合、互相覆蓋歷史 | 兩個請求同時打同一串，只有一個 `acquired`，另一個回「⏳ 正在處理中」；殺掉處理中的實例，10 分鐘後能重新搶到 |
+| 3 串記錄 | 每一句用一個原子操作完成：追加歷史＋翻 `next_turn`＋（翻回 gpt 時）`round_count + 1` | 先讀再寫會被插隊，導致歷史掉句或回合數算錯 | 並行追加 N 句，歷史剛好 N 句、回合數正確 |
+| 4 頻道隔離 | 唯一鍵是 `(channel_id, thread_ts)`，鎖、歷史、回合數都依這組鍵 | 不同頻道的 `thread_ts` 可能相同 | 兩個頻道用同一個 `thread_ts`，各自獨立計數、互不干擾 |
+
+新家如果是 Postgres：v6 的 `slack_thread_append` 和 v7 的 `slack_thread_acquire` 改幾行就能用（原檔在 `supabase/migrations/`，資料封存在 Jstsys-FOD）。不是 Postgres：去重用「唯一鍵＋插入失敗即略過」，串鎖用「條件更新＋租約時間」，概念一樣。
+
 > 下列密鑰一律由你（使用者）自行設定，**絕不會**放進這個 repo 或任何 commit。
 
 相關檔案：
