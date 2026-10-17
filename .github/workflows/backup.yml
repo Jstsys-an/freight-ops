@@ -64,6 +64,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -o pipefail
           gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
             --jq '[.[] | select(.tagName | startswith("backup-"))] | sort_by(.createdAt) | reverse | .[8:] | .[].tagName' |
           while read -r tag; do
