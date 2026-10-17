@@ -20,14 +20,36 @@ jobs:
           node-version: '20'
 
       - name: JS 語法檢查
+        shell: bash
         run: |
-          for f in js/*.js .github/scripts/*.mjs; do
-            node --check "$f"
+          node --version
+          shopt -s nullglob
+          for pattern in 'js/*.js' '.github/scripts/*.mjs'; do
+            files=( $pattern )
+            if (( ${#files[@]} == 0 )); then
+              echo "::error::No files matched required pattern: $pattern"
+              exit 1
+            fi
+            for f in "${files[@]}"; do
+              echo "Checking $f"
+              if ! node --check "$f"; then
+                echo "::error file=$f::JavaScript syntax check failed"
+                exit 1
+              fi
+            done
           done
 
       - uses: denoland/setup-deno@v2
+        id: deno
         with:
           deno-version: v2.x
 
-      - name: slack-bridge 單元測試
-        run: deno test supabase/functions/slack-bridge/lib_test.ts supabase/functions/slack-bridge/verify_test.ts
+      - name: Deno 版本
+        run: deno --version
+
+      - name: slack-bridge lib 單元測試
+        run: deno test supabase/functions/slack-bridge/lib_test.ts
+
+      - name: slack-bridge verify 單元測試
+        if: ${{ !cancelled() && steps.deno.outcome == 'success' }}
+        run: deno test supabase/functions/slack-bridge/verify_test.ts
